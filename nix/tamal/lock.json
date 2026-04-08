@@ -1,6 +1,6 @@
 {"v":"1.0.0"
 ,"i":{
-"nixpkgs":{"kd":[1,{"ft":0,"ur":"https://github.com/NixOS/nixpkgs/archive/6201e203d09599479a3b3450ed24fa81537ebc4e.tar.gz","ms":[]}],"ha":{"al":0,"vl":"sha256-ZojAnPuCdy657PbTq5V0Y+AHKhZAIwSIT2cb8UgAz/U="},"fv":"6201e203d09599479a3b3450ed24fa81537ebc4e","ps":[]}
+"nixpkgs":{"kd":[1,{"ft":0,"ur":"https://github.com/NixOS/nixpkgs/archive/68d8aa3d661f0e6bd5862291b5bb263b2a6595c9.tar.gz","ms":[]}],"ha":{"al":0,"vl":"sha256-vPKLpjhIVWdDrfiUM8atW6YkIggCEKdSAlJPzzhkQlw="},"fv":"68d8aa3d661f0e6bd5862291b5bb263b2a6595c9","ps":[]}
 }
 ,"p":{}
 }

@@ -9,7 +9,7 @@ python3.pkgs.buildPythonPackage {
     pyproject = true;
 
     build-system = with python3.pkgs; [ setuptools ];
-    dependencies = with python3.pkgs; [ networkx ];
+    dependencies = with python3.pkgs; [ networkx z3-solver ];
 
     meta = {
         license = with lib.licenses; [ publicDomain ];

@@ -1,4 +1,9 @@
+from __future__ import annotations
+
+import os
 import unittest
+from collections.abc import Hashable, Mapping
+from collections import defaultdict
 from random import Random
 
 import networkx as nx
@@ -39,57 +44,105 @@ def random_connected_graph(r: Random, nodes: int, labels: int, variable_kinds: i
 
     return g
 
+def is_valid_match(
+    target_graph: nx.DiGraph[int],
+    query_graph: nx.DiGraph[int],
+    node_mapping: dict[int, int],
+    variable_mapping: Mapping[Hashable, Mapping[int, int]],
+) -> bool:
+    if set(node_mapping) != set(target_graph.nodes):
+        return False
+    if len(set(node_mapping.values())) != len(node_mapping):
+        return False
+
+    computed_variable_mapping: defaultdict[Hashable, dict[int, int]] = defaultdict(dict)
+    for target_node, query_node in node_mapping.items():
+        if query_node not in query_graph:
+            return False
+
+        target_class, target_identifier = target_graph.nodes[target_node]["label"]
+        query_class, query_identifier = query_graph.nodes[query_node]["label"]
+        if target_class is None:
+            if query_class is not None or query_identifier != target_identifier:
+                return False
+        else:
+            if query_class != target_class:
+                return False
+            existing = computed_variable_mapping[target_class].get(target_identifier)
+            if existing is not None and existing != query_identifier:
+                return False
+            computed_variable_mapping[target_class][target_identifier] = query_identifier
+
+    for source, target in target_graph.edges:
+        if not query_graph.has_edge(node_mapping[source], node_mapping[target]):
+            return False
+
+    return {
+        variable_class: dict(identifier_mapping)
+        for variable_class, identifier_mapping in computed_variable_mapping.items()
+    } == dict(variable_mapping)
 
 class TestFuzz(unittest.TestCase):
     def test_fuzz(self):
-        for i in range(100):
+        fuzz_count = int(os.environ.get("FUZZ_COUNT", 100))
+        fuzz_offset = int(os.environ.get("FUZZ_OFFSET", 0))
+        for i in range(fuzz_offset, fuzz_offset + fuzz_count):
             r = Random(i)
-            d = Database(node_label=lambda attrs: attrs['label'])
+            d: Database[int, int] = Database(node_label=lambda attrs: attrs['label'])
             def rcg(n=None):
                 if n is None:
                     n = r.randrange(3, 100)
                 return random_connected_graph(r, n, r.randrange(1, 10), r.randrange(1, 100), r.randrange(1, 10), r.random(), r.random())
 
             for _ in range(r.randrange(100)):
-                d.update(rcg())
+                d.index(rcg())
             targets = [rcg() for _ in range(r.randrange(1, 5))]
             for t in targets:
-                d.update(t)
+                d.index(t)
 
-            query = rcg(r.randrange(100, 1000))
-            nodes = list(query)
+            needed_nodes = sum(len(t) for t in targets)
+            query = rcg(r.randrange(needed_nodes, needed_nodes * 10))
+            available_nodes = list(query)
             variables = list(range(1000))
             r.shuffle(variables)
-            r.shuffle(nodes)
-            target_info = []
+            r.shuffle(available_nodes)
             for t in targets:
-                m = t.copy()
-                var_mapping = {}
-                node_mapping = {}
-                for n in m:
-                    matching = nodes.pop()
-                    node_mapping[n] = m
-                    varkind, idx = m.nodes[n]['label']
+                var_mapping: defaultdict[str, dict[int, int]] = defaultdict(dict)
+                node_mapping: dict[int, int] = {}
+                for n in t:
+                    if n in node_mapping:
+                        matching = node_mapping[n]
+                    else:
+                        matching = available_nodes.pop()
+                        node_mapping[n] = matching
+
+                    for succ in t.succ[n]:
+                        if succ in node_mapping:
+                            succ_matching = node_mapping[succ]
+                        else:
+                            succ_matching = available_nodes.pop()
+                            node_mapping[succ] = succ_matching
+                        query.add_edge(matching, succ_matching)
+                    varkind, idx = t.nodes[n]['label']
                     if varkind is None:
                         query.nodes[matching]['label'] = (None, idx)
-                    elif (varkind, idx) in var_mapping:
-                        query.nodes[matching]['label'] = (varkind, var_mapping[varkind, idx])
+                    elif idx in var_mapping[varkind]:
+                        query.nodes[matching]['label'] = (varkind, var_mapping[varkind][idx])
                     else:
                         new_var = variables.pop()
-                        var_mapping[varkind, idx] = new_var
+                        var_mapping[varkind][idx] = new_var
                         query.nodes[matching]['label'] = (varkind, new_var)
 
-                target_info.append((node_mapping, var_mapping))
-
-            result = d.query(query)
-            for found_graph, found_node_mapping, found_var_mapping in result:
-                for idx, (target_graph, (node_mapping, var_mapping)) in enumerate(zip(targets, target_info)):
-                    if target_graph is found_graph and node_mapping == found_node_mapping and var_mapping == found_var_mapping:
+            result = list(d.query(query))
+            for target_graph in targets:
+                for found_graph, found_node_mapping, found_var_mapping in result:
+                    if target_graph is found_graph and is_valid_match(target_graph, query, found_node_mapping, found_var_mapping):
                         break
                 else:
-                    assert False, "Could not find a target subgraph in the query"
+                    assert False, "There is no corresponding finding for this target"
+
+            print("OK", i)
 
 
 if __name__ == '__main__':
     unittest.main()
-
