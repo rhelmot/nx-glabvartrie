@@ -9,6 +9,10 @@ from typing import Any, Callable, Generic, Hashable, TypeVar
 
 import networkx as nx
 try:
+    from ortools.sat.python import cp_model
+except Exception:
+    cp_model = None
+try:
     import z3
 except Exception:
     z3 = None
@@ -336,12 +340,17 @@ def _automorphisms_for_position_graph(
     adjacency: tuple[tuple[bool, ...], ...],
     neighbours: tuple[tuple[int, ...], ...],
     neighbour_counts: tuple[int, ...],
+    color_classes: tuple[tuple[int, ...], ...],
 ) -> tuple[tuple[int, ...], ...]:
     size = len(adjacency)
     if size == 0:
         return ((),)
 
     support = _support_matrix(neighbours, neighbour_counts)
+    color_by_position = [-1] * size
+    for color_index, color_class in enumerate(color_classes):
+        for position in color_class:
+            color_by_position[position] = color_index
     mapping = [-1] * size
     reverse_mapping = [-1] * size
     automorphisms: list[tuple[int, ...]] = []
@@ -376,7 +385,12 @@ def _automorphisms_for_position_graph(
                 if mapped_source == -1:
                     continue
                 for neighbour in neighbours[mapped_source]:
-                    if already_seen[neighbour] or reverse_mapping[neighbour] != -1 or not support[target_position][neighbour]:
+                    if (
+                        already_seen[neighbour]
+                        or reverse_mapping[neighbour] != -1
+                        or color_by_position[target_position] != color_by_position[neighbour]
+                        or not support[target_position][neighbour]
+                    ):
                         continue
                     image_candidates.append(neighbour)
                     already_seen[neighbour] = True
@@ -384,7 +398,11 @@ def _automorphisms_for_position_graph(
             image_candidates.extend(
                 position
                 for position in range(size)
-                if reverse_mapping[position] == -1 and support[target_position][position]
+                if (
+                    reverse_mapping[position] == -1
+                    and color_by_position[target_position] == color_by_position[position]
+                    and support[target_position][position]
+                )
             )
 
         for image_position in image_candidates:
@@ -409,7 +427,7 @@ def _automorphisms_for_position_graph(
             mapping[target_position] = -1
 
     for image_position in range(size):
-        if not support[0][image_position]:
+        if color_by_position[0] != color_by_position[image_position] or not support[0][image_position]:
             continue
         mapping[0] = image_position
         reverse_mapping[image_position] = 0
@@ -466,7 +484,7 @@ def _symmetry_conditions(graph: nx.DiGraph[N], order: tuple[N, ...]) -> tuple[tu
     if len(order) > 18 or ambiguous_nodes > 12:
         return ()
 
-    automorphisms = _automorphisms_for_position_graph(adjacency, neighbours, neighbour_counts)
+    automorphisms = _automorphisms_for_position_graph(adjacency, neighbours, neighbour_counts, color_classes)
     if len(automorphisms) <= 1:
         return ()
 
@@ -801,7 +819,6 @@ class Database(Generic[N, V]):
                 use_lookahead,
             )
         else:
-            priority = self._direct_graph_priority(stored, query_data)[0]
             match: tuple[NodeMapping[N], VariableMapping[V]] | None
             try:
                 deadline = (
@@ -819,10 +836,7 @@ class Database(Generic[N, V]):
                     deadline=deadline,
                 )
             except _SearchTimeout:
-                if self._z3_enabled and stored.graph.number_of_nodes() >= 60 and priority <= 4:
-                    match = self._find_single_graph_match_z3(stored, query_data)
-                else:
-                    match = None
+                match = self._timeout_fallback_match(stored, query_data)
             if match is not None:
                 local_matches.append(match)
         for node_mapping, variable_mapping in local_matches:
@@ -847,6 +861,22 @@ class Database(Generic[N, V]):
                 for variable_class, identifiers in used_query_identifiers.items()
             },
         )
+
+    def _timeout_fallback_match(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        if stored.graph.number_of_nodes() < 60:
+            return None
+        if self._direct_graph_priority(stored, query_data)[0] > 16:
+            return None
+        match = self._find_single_graph_match_ortools(stored, query_data)
+        if match is not None:
+            return match
+        if self._z3_enabled and cp_model is None:
+            return self._find_single_graph_match_z3(stored, query_data)
+        return None
 
     def _enumerate_single_graph_best_first(
         self,
@@ -914,10 +944,8 @@ class Database(Generic[N, V]):
                 if target_class is not None:
                     query_identifier = query_data.labels[query_node][1]
                     variable_mapping = new_target_var_to_query_identifier.setdefault(target_class, {})
-                    identifier_set = new_used_query_identifiers.setdefault(target_class, set())
                     if target_identifier not in variable_mapping:
                         variable_mapping[target_identifier] = query_identifier
-                        identifier_set.add(query_identifier)
 
                 serial += 1
                 heappush(
@@ -1066,7 +1094,7 @@ class Database(Generic[N, V]):
                 ),
             )
         except _SearchTimeout:
-            match = None
+            match = self._timeout_fallback_match(stored, query_data)
         if match is not None:
             node_mapping, variable_mapping = match
             matches.append((stored.graph, node_mapping, variable_mapping))
@@ -1097,9 +1125,8 @@ class Database(Generic[N, V]):
             if existing is not None and existing != query_identifier:
                 raise ValueError("Matched target variable maps to multiple query identifiers")
             target_var_to_query_identifier[target_class][target_identifier] = query_identifier
-            used_query_identifiers[target_class].add(query_identifier)
 
-        return dict(target_var_to_query_identifier), {key: set(value) for key, value in used_query_identifiers.items()}
+        return dict(target_var_to_query_identifier), {}
 
     def _partial_conditions_hold(
         self,
@@ -1308,19 +1335,14 @@ class Database(Generic[N, V]):
         if target_class is not None:
             query_identifier = query_data.labels[assigned_query][1]
             variable_mapping = next_target_var_to_query_identifier.setdefault(target_class, {})
-            identifier_set = next_used_query_identifiers.setdefault(target_class, set())
             existing_query_identifier = variable_mapping.get(target_identifier)
             if existing_query_identifier is not None:
                 if existing_query_identifier != query_identifier:
                     return None
             else:
-                if query_identifier in identifier_set:
-                    return None
                 variable_mapping[target_identifier] = query_identifier
-                identifier_set.add(query_identifier)
 
             same_identifier_domain = query_data.variable_identifier_nodes.get((target_class, query_identifier), frozenset())
-            query_identifier_nodes = query_data.variable_identifier_nodes.get((target_class, query_identifier), frozenset())
             for variable_target in stored.variable_class_nodes.get(target_class, ()):
                 if variable_target == assigned_target:
                     continue
@@ -1329,7 +1351,7 @@ class Database(Generic[N, V]):
                 if variable_target_identifier == target_identifier:
                     reduced = current_domain & same_identifier_domain
                 else:
-                    reduced = current_domain - query_identifier_nodes
+                    reduced = current_domain
                 if not reduced:
                     return None
                 next_domains[variable_target] = reduced
@@ -1378,10 +1400,7 @@ class Database(Generic[N, V]):
         if existing is not None:
             return query_data.variable_identifier_masks.get((target_class, existing), 0)
 
-        mask = query_data.variable_masks.get(target_class, 0)
-        for identifier in used_query_identifiers.get(target_class, set()):
-            mask &= query_data.all_nodes_mask ^ query_data.variable_identifier_masks.get((target_class, identifier), 0)
-        return mask
+        return query_data.variable_masks.get(target_class, 0)
 
     def _initial_single_graph_masks(
         self,
@@ -1576,19 +1595,14 @@ class Database(Generic[N, V]):
         if target_class is not None:
             query_identifier = query_data.labels[query_data.index_to_node[assigned_query_index]][1]
             variable_mapping = next_target_var_to_query_identifier.setdefault(target_class, {})
-            identifier_set = next_used_query_identifiers.setdefault(target_class, set())
             existing_query_identifier = variable_mapping.get(target_identifier)
             if existing_query_identifier is not None:
                 if existing_query_identifier != query_identifier:
                     return None
             else:
-                if query_identifier in identifier_set:
-                    return None
                 variable_mapping[target_identifier] = query_identifier
-                identifier_set.add(query_identifier)
 
             same_identifier_mask = query_data.variable_identifier_masks.get((target_class, query_identifier), 0)
-            query_identifier_mask = query_data.variable_identifier_masks.get((target_class, query_identifier), 0)
             for variable_target in stored.variable_class_nodes.get(target_class, ()):
                 if variable_target == assigned_target:
                     continue
@@ -1597,7 +1611,7 @@ class Database(Generic[N, V]):
                 if variable_target_identifier == target_identifier:
                     reduced_mask = current_mask & same_identifier_mask
                 else:
-                    reduced_mask = current_mask & (query_data.all_nodes_mask ^ query_identifier_mask)
+                    reduced_mask = current_mask
                 if not reduced_mask:
                     return None
                 next_masks[variable_target] = reduced_mask
@@ -1701,7 +1715,7 @@ class Database(Generic[N, V]):
         solver = z3.Solver()
         solver.set(timeout=10_000)
 
-        assignment_variables: dict[tuple[int, int], z3.BoolRef] = {
+        assignment_variables: dict[tuple[int, int], Any] = {
             (target_index, query_index): z3.Bool(f"x_{target_index}_{query_index}")
             for target_index, target_candidates in enumerate(candidates)
             for query_index in target_candidates
@@ -1772,16 +1786,6 @@ class Database(Generic[N, V]):
                         1,
                     )
                 )
-            for query_identifier in query_identifiers:
-                solver.add(
-                    z3.PbLe(
-                        [
-                            (identifier_variables[(identifier, query_identifier)], 1)
-                            for identifier in target_groups
-                        ],
-                        1,
-                    )
-                )
             for identifier, target_indices in target_groups.items():
                 for target_index in target_indices:
                     for query_index in candidates[target_index]:
@@ -1802,6 +1806,114 @@ class Database(Generic[N, V]):
             for target_index, target_node in enumerate(order)
             for query_index in candidates[target_index]
             if z3.is_true(model.evaluate(assignment_variables[(target_index, query_index)], model_completion=True))
+        }
+        if len(node_mapping) != len(order):
+            return None
+
+        ordered_query_nodes = [node_mapping[target_node] for target_node in order]
+        return node_mapping, self._variable_mapping(stored, query_data, ordered_query_nodes)
+
+    def _find_single_graph_match_ortools(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        if cp_model is None:
+            return None
+        cp: Any = cp_model
+
+        order = list(stored.order)
+        query_nodes = list(query_data.graph.nodes)
+        query_position = {node: position for position, node in enumerate(query_nodes)}
+        target_position = {node: position for position, node in enumerate(order)}
+
+        candidates = [
+            [query_position[query_node] for query_node in self._dynamic_candidates_for_target(stored, target_node, {}, query_data, set(), {}, {})]
+            for target_node in order
+        ]
+        if any(not target_candidates for target_candidates in candidates):
+            return None
+
+        model: Any = cp.CpModel()
+        assignment_variables: dict[tuple[int, int], Any] = {
+            (target_index, query_index): model.NewBoolVar(f"x_{target_index}_{query_index}")
+            for target_index, target_candidates in enumerate(candidates)
+            for query_index in target_candidates
+        }
+
+        for target_index, target_candidates in enumerate(candidates):
+            model.AddExactlyOne(assignment_variables[(target_index, query_index)] for query_index in target_candidates)
+
+        uses_by_query: defaultdict[int, list[Any]] = defaultdict(list)
+        for (target_index, query_index), variable in assignment_variables.items():
+            del target_index
+            uses_by_query[query_index].append(variable)
+        for uses in uses_by_query.values():
+            model.AddAtMostOne(uses)
+
+        query_successors = [set(query_data.graph.succ[node]) for node in query_nodes]
+        for source, target in stored.graph.edges:
+            source_index = target_position[source]
+            target_index = target_position[target]
+            for source_query_index in candidates[source_index]:
+                for target_query_index in candidates[target_index]:
+                    if query_nodes[target_query_index] in query_successors[source_query_index]:
+                        continue
+                    model.AddBoolOr(
+                        [
+                            assignment_variables[(source_index, source_query_index)].Not(),
+                            assignment_variables[(target_index, target_query_index)].Not(),
+                        ]
+                    )
+
+        variables_by_class: dict[VariableClass, dict[V, list[int]]] = {}
+        for target_index, target_node in enumerate(order):
+            variable_class, identifier = stored.labels[target_node]
+            if variable_class is None:
+                continue
+            variables_by_class.setdefault(variable_class, {}).setdefault(identifier, []).append(target_index)
+
+        for variable_class, target_groups in variables_by_class.items():
+            query_identifiers = sorted(
+                {
+                    query_data.labels[query_nodes[query_index]][1]
+                    for target_indices in target_groups.values()
+                    for target_index in target_indices
+                    for query_index in candidates[target_index]
+                    if query_data.labels[query_nodes[query_index]][0] == variable_class
+                },
+                key=repr,
+            )
+            identifier_variables = {
+                (identifier, query_identifier): model.NewBoolVar(
+                    f"y_{repr(variable_class)}_{repr(identifier)}_{repr(query_identifier)}"
+                )
+                for identifier in target_groups
+                for query_identifier in query_identifiers
+            }
+            for identifier in target_groups:
+                model.AddExactlyOne(identifier_variables[(identifier, query_identifier)] for query_identifier in query_identifiers)
+            for identifier, target_indices in target_groups.items():
+                for target_index in target_indices:
+                    for query_index in candidates[target_index]:
+                        query_identifier = query_data.labels[query_nodes[query_index]][1]
+                        model.AddImplication(
+                            assignment_variables[(target_index, query_index)],
+                            identifier_variables[(identifier, query_identifier)],
+                        )
+
+        solver: Any = cp.CpSolver()
+        solver.parameters.max_time_in_seconds = 3.0
+        solver.parameters.num_search_workers = 8
+        status = solver.Solve(model)
+        if status not in (cp.OPTIMAL, cp.FEASIBLE):
+            return None
+
+        node_mapping = {
+            target_node: query_nodes[query_index]
+            for target_index, target_node in enumerate(order)
+            for query_index in candidates[target_index]
+            if solver.BooleanValue(assignment_variables[(target_index, query_index)])
         }
         if len(node_mapping) != len(order):
             return None
@@ -1924,7 +2036,7 @@ class Database(Generic[N, V]):
         if existing is not None:
             return query_identifier == existing
 
-        return query_identifier not in used_query_identifiers.get(target_class, set())
+        return True
 
     def _dynamic_candidates_for_target(
         self,
@@ -2044,10 +2156,8 @@ class Database(Generic[N, V]):
                 if target_class is not None:
                     query_identifier = query_data.labels[query_node][1]
                     variable_mapping = target_var_to_query_identifier.setdefault(target_class, {})
-                    identifier_set = used_query_identifiers.setdefault(target_class, set())
                     if target_identifier not in variable_mapping:
                         variable_mapping[target_identifier] = query_identifier
-                        identifier_set.add(query_identifier)
                         added_variable_mapping = True
 
                 next_key = self._dynamic_next_choice_key(
@@ -2062,11 +2172,8 @@ class Database(Generic[N, V]):
 
                 if target_class is not None and added_variable_mapping and query_identifier is not None:
                     del target_var_to_query_identifier[target_class][target_identifier]
-                    used_query_identifiers[target_class].remove(query_identifier)
                     if not target_var_to_query_identifier[target_class]:
                         del target_var_to_query_identifier[target_class]
-                    if not used_query_identifiers[target_class]:
-                        del used_query_identifiers[target_class]
 
                 used_query_nodes.remove(query_node)
                 del target_to_query[best_target]
@@ -2110,10 +2217,8 @@ class Database(Generic[N, V]):
             if target_class is not None:
                 query_identifier = query_data.labels[query_node][1]
                 variable_mapping = target_var_to_query_identifier.setdefault(target_class, {})
-                identifier_set = used_query_identifiers.setdefault(target_class, set())
                 if target_identifier not in variable_mapping:
                     variable_mapping[target_identifier] = query_identifier
-                    identifier_set.add(query_identifier)
                     added_variable_mapping = True
 
             if self._complete_single_graph_dynamic(
@@ -2128,11 +2233,8 @@ class Database(Generic[N, V]):
 
             if target_class is not None and added_variable_mapping and query_identifier is not None:
                 del target_var_to_query_identifier[target_class][target_identifier]
-                used_query_identifiers[target_class].remove(query_identifier)
                 if not target_var_to_query_identifier[target_class]:
                     del target_var_to_query_identifier[target_class]
-                if not used_query_identifiers[target_class]:
-                    del used_query_identifiers[target_class]
 
             used_query_nodes.remove(query_node)
             del target_to_query[best_target]
@@ -2182,10 +2284,8 @@ class Database(Generic[N, V]):
             if target_class is not None:
                 query_identifier = query_data.labels[query_node][1]
                 variable_mapping = target_var_to_query_identifier.setdefault(target_class, {})
-                identifier_set = used_query_identifiers.setdefault(target_class, set())
                 if target_identifier not in variable_mapping:
                     variable_mapping[target_identifier] = query_identifier
-                    identifier_set.add(query_identifier)
                     added_variable_mapping = True
 
             stop = self._enumerate_single_graph_dynamic(
@@ -2202,11 +2302,8 @@ class Database(Generic[N, V]):
 
             if target_class is not None and added_variable_mapping and query_identifier is not None:
                 del target_var_to_query_identifier[target_class][target_identifier]
-                used_query_identifiers[target_class].remove(query_identifier)
                 if not target_var_to_query_identifier[target_class]:
                     del target_var_to_query_identifier[target_class]
-                if not used_query_identifiers[target_class]:
-                    del used_query_identifiers[target_class]
 
             used_query_nodes.remove(query_node)
             del target_to_query[best_target]
