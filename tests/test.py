@@ -218,6 +218,58 @@ class TestFuzz(unittest.TestCase):
                 else:
                     assert False, "There is no corresponding finding for this target"
 
+    def test_fuzz_many_small_sparse_query(self):
+        fuzz_count = int(os.environ.get("FUZZ_COUNT", 100))
+        fuzz_offset = int(os.environ.get("FUZZ_OFFSET", 0))
+
+        def rcg(r: Random, n: int | None = None):
+            if n is None:
+                n = r.randrange(3, 11)
+            return random_connected_graph(
+                r,
+                range(n),
+                range(r.randrange(1, 10)),
+                range(r.randrange(1, 100)),
+                range(r.randrange(1, 10)),
+                r.random(),
+                0.02,
+            )
+
+        for i in range(fuzz_offset, fuzz_offset + fuzz_count):
+            r = Random(i)
+            d: Database[int, int] = Database(node_label=lambda attrs: attrs['label'])
+
+            for _ in range(r.randrange(500, 2001)):
+                d.index(rcg(r))
+            targets = [rcg(r) for _ in range(r.randrange(1, 5))]
+            for t in targets:
+                d.index(t)
+
+            needed_nodes = sum(len(t) for t in targets)
+            query = random_connected_graph(
+                r,
+                range(r.randrange(max(50, needed_nodes), 101)),
+                range(r.randrange(1, 10)),
+                range(r.randrange(1, 100)),
+                range(r.randrange(1, 10)),
+                r.random(),
+                0.02,
+            )
+            available_nodes = list(query)
+            variables = list(range(1000))
+            r.shuffle(variables)
+            r.shuffle(available_nodes)
+            for t in targets:
+                embed_graph(query, t, available_nodes, variables)
+
+            result = list(d.query(query))
+            for target_graph in targets:
+                for found_graph, found_node_mapping, found_var_mapping in result:
+                    if target_graph is found_graph and is_valid_match(target_graph, query, found_node_mapping, found_var_mapping):
+                        break
+                else:
+                    assert False, "There is no corresponding finding for this target"
+
             print("OK", i)
 
 
