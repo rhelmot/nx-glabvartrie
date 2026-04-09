@@ -4,7 +4,6 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
 import os
-import time
 from typing import Any, Callable, Generic, Hashable, Iterator, TypeVar
 
 import networkx as nx
@@ -32,6 +31,26 @@ def _env_enabled(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _iter_mask_indices(mask: int) -> Iterator[int]:
     while mask:
         low_bit = mask & -mask
@@ -41,6 +60,21 @@ def _iter_mask_indices(mask: int) -> Iterator[int]:
 
 class _SearchTimeout(Exception):
     pass
+
+
+@dataclass(slots=True)
+class _OperationBudget:
+    remaining: int
+
+    def spend(self, cost: int = 1) -> None:
+        self.remaining -= cost
+        if self.remaining < 0:
+            raise _SearchTimeout
+
+
+def _spend(budget: _OperationBudget | None, cost: int = 1) -> None:
+    if budget is not None:
+        budget.spend(cost)
 
 
 def _label_stats(labels: dict[N, Label[V]]) -> tuple[Counter[V], dict[VariableClass, tuple[int, ...]]]:
@@ -672,7 +706,21 @@ class Database(Generic[N, V]):
         self._node_label = node_label
         self._graphs: list[_StoredGraph[N, V]] = []
         self._root = _TrieNode(depth=0, topology_pattern=None)
+        self._heuristic_fallbacks_enabled = _env_enabled("GLABVARTRIE_ENABLE_HEURISTIC_FALLBACKS", True)
+        self._ortools_enabled = _env_enabled("GLABVARTRIE_ENABLE_ORTOOLS", True) and cp_model is not None
         self._z3_enabled = _env_enabled("GLABVARTRIE_ENABLE_Z3", True) and z3 is not None
+        self._native_ops = _env_int("GLABVARTRIE_NATIVE_OPS", 1_000_000)
+        self._scc_ops = _env_int("GLABVARTRIE_SCC_OPS", 20_000_000)
+        self._anchored_ops = _env_int("GLABVARTRIE_ANCHORED_OPS", 6_000_000)
+        self._z3_rlimit = _env_int("GLABVARTRIE_Z3_RLIMIT", 5_000_000)
+        self._ortools_deterministic_time = _env_float("GLABVARTRIE_ORTOOLS_DETERMINISTIC_TIME", 0.2)
+
+    def _native_budget(self, stored: _StoredGraph[N, V]) -> _OperationBudget | None:
+        if stored.graph.number_of_nodes() < 50:
+            return None
+        if not (self._heuristic_fallbacks_enabled or self._ortools_enabled or self._z3_enabled):
+            return None
+        return _OperationBudget(self._native_ops)
 
     def _build_stored_graph(
         self,
@@ -865,11 +913,7 @@ class Database(Generic[N, V]):
         else:
             match: tuple[NodeMapping[N], VariableMapping[V]] | None
             try:
-                deadline = (
-                    time.monotonic() + 1.0
-                    if self._z3_enabled and stored.graph.number_of_nodes() >= 50
-                    else None
-                )
+                budget = self._native_budget(stored)
                 match = self._find_single_graph_match(
                     stored,
                     query_data,
@@ -877,7 +921,7 @@ class Database(Generic[N, V]):
                     set(),
                     {},
                     {},
-                    deadline=deadline,
+                    budget=budget,
                 )
             except _SearchTimeout:
                 match = self._timeout_fallback_match(stored, query_data)
@@ -913,16 +957,17 @@ class Database(Generic[N, V]):
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         if stored.graph.number_of_nodes() < 50:
             return None
-        if self._direct_graph_priority(stored, query_data)[0] <= 16:
+        if self._heuristic_fallbacks_enabled and self._direct_graph_priority(stored, query_data)[0] <= 16:
             match = self._find_single_graph_match_scc_decomposed(stored, query_data)
             if match is not None:
                 return match
             match = self._find_single_graph_match_anchored(stored, query_data)
             if match is not None:
                 return match
-        match = self._find_single_graph_match_ortools(stored, query_data)
-        if match is not None:
-            return match
+        if self._ortools_enabled:
+            match = self._find_single_graph_match_ortools(stored, query_data)
+            if match is not None:
+                return match
         if self._z3_enabled:
             return self._find_single_graph_match_z3(stored, query_data)
         return None
@@ -957,7 +1002,7 @@ class Database(Generic[N, V]):
             target_component = component_index[target]
             if source_component != target_component:
                 condensation.add_edge(source_component, target_component)
-        overall_deadline = time.monotonic() + 20.0
+        budget = _OperationBudget(self._scc_ops)
         subgraph_cache: dict[frozenset[N], _StoredGraph[N, V]] = {}
 
         def component_setup(
@@ -1003,7 +1048,7 @@ class Database(Generic[N, V]):
                 used_query_nodes,
                 target_var_to_query_identifier,
                 used_query_identifiers,
-                overall_deadline,
+                budget,
             )
             if masks is None:
                 return None
@@ -1012,7 +1057,7 @@ class Database(Generic[N, V]):
                 query_data,
                 partial_mapping,
                 masks,
-                overall_deadline,
+                budget,
             )
             if refined is None:
                 return None
@@ -1042,8 +1087,7 @@ class Database(Generic[N, V]):
             target_to_query: dict[N, N],
             assigned_components: frozenset[int],
         ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
-            if time.monotonic() >= overall_deadline:
-                raise _SearchTimeout
+            _spend(budget)
             if len(assigned_components) == len(sccs):
                 ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
                 if not _conditions_hold(stored.full_conditions, ordered_query_nodes, query_data.node_ranks):
@@ -1074,7 +1118,7 @@ class Database(Generic[N, V]):
                 target_var_to_query_identifier,
                 used_query_identifiers,
                 match_limit,
-                overall_deadline,
+                budget,
             )
             for component_mapping, _ in component_matches:
                 next_target_to_query = dict(target_to_query)
@@ -1303,11 +1347,7 @@ class Database(Generic[N, V]):
                 used_query_nodes,
                 target_var_to_query_identifier,
                 used_query_identifiers,
-                deadline=(
-                    time.monotonic() + 1.0
-                    if self._z3_enabled and stored.graph.number_of_nodes() >= 50
-                    else None
-                ),
+                budget=self._native_budget(stored),
             )
         except _SearchTimeout:
             match = self._timeout_fallback_match(stored, query_data)
@@ -1626,7 +1666,7 @@ class Database(Generic[N, V]):
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
-        deadline: float | None = None,
+        budget: _OperationBudget | None = None,
     ) -> dict[N, int] | None:
         used_mask = 0
         for query_node in used_query_nodes:
@@ -1634,8 +1674,7 @@ class Database(Generic[N, V]):
 
         masks: dict[N, int] = {}
         for target_node in stored.order:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise _SearchTimeout
+            _spend(budget)
             target_in_degree = stored.in_degrees[target_node]
             target_out_degree = stored.out_degrees[target_node]
             requires_self_loop = target_node in stored.successors[target_node]
@@ -1682,8 +1721,7 @@ class Database(Generic[N, V]):
 
             filtered_mask = 0
             for query_index in _iter_mask_indices(mask):
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise _SearchTimeout
+                _spend(budget)
                 query_node = query_data.index_to_node[query_index]
                 if query_data.in_degrees[query_node] < target_in_degree or query_data.out_degrees[query_node] < target_out_degree:
                     continue
@@ -1736,21 +1774,19 @@ class Database(Generic[N, V]):
         query_data: _QueryData[N, V],
         target_to_query: dict[N, N],
         masks: dict[N, int],
-        deadline: float | None = None,
+        budget: _OperationBudget | None = None,
     ) -> dict[N, int] | None:
         refined = dict(masks)
 
         changed = True
         while changed:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise _SearchTimeout
+            _spend(budget)
             changed = False
             for target_node in stored.order:
                 current_mask = refined[target_node]
                 filtered_mask = 0
                 for query_index in _iter_mask_indices(current_mask):
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise _SearchTimeout
+                    _spend(budget)
                     if self._mask_candidate_supported(
                         stored,
                         target_node,
@@ -1802,8 +1838,9 @@ class Database(Generic[N, V]):
         assigned_query_index: int,
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
-        deadline: float | None = None,
+        budget: _OperationBudget | None = None,
     ) -> tuple[dict[N, int], dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]]] | None:
+        _spend(budget)
         assigned_bit = 1 << assigned_query_index
         next_masks = {target_node: (assigned_bit if target_node == assigned_target else mask & (query_data.all_nodes_mask ^ assigned_bit)) for target_node, mask in masks.items()}
         if any(mask == 0 for mask in next_masks.values()):
@@ -1861,7 +1898,7 @@ class Database(Generic[N, V]):
             query_data,
             target_to_query,
             next_masks,
-            deadline,
+            budget,
         )
         if refined is None:
             return None
@@ -1876,13 +1913,12 @@ class Database(Generic[N, V]):
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
-        deadline: float | None = None,
+        budget: _OperationBudget | None = None,
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         if not self._partial_conditions_hold(stored, target_to_query, query_data):
             return None
 
-        if deadline is not None and time.monotonic() >= deadline:
-            raise _SearchTimeout
+        _spend(budget)
         masks = self._initial_single_graph_masks(
             stored,
             query_data,
@@ -1890,7 +1926,7 @@ class Database(Generic[N, V]):
             used_query_nodes,
             target_var_to_query_identifier,
             used_query_identifiers,
-            deadline,
+            budget,
         )
         if masks is None:
             return None
@@ -1900,7 +1936,7 @@ class Database(Generic[N, V]):
             query_data,
             target_to_query,
             masks,
-            deadline,
+            budget,
         )
         if refined is None:
             return None
@@ -1913,7 +1949,7 @@ class Database(Generic[N, V]):
             dict(refined),
             variable_state[0],
             variable_state[1],
-            deadline,
+            budget,
         )
 
     def _enumerate_single_graph_matches(
@@ -1925,7 +1961,7 @@ class Database(Generic[N, V]):
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
         match_limit: int,
-        deadline: float | None = None,
+        budget: _OperationBudget | None = None,
     ) -> list[tuple[NodeMapping[N], VariableMapping[V]]]:
         if not self._partial_conditions_hold(stored, target_to_query, query_data):
             return []
@@ -1937,7 +1973,7 @@ class Database(Generic[N, V]):
             used_query_nodes,
             target_var_to_query_identifier,
             used_query_identifiers,
-            deadline,
+            budget,
         )
         if masks is None:
             return []
@@ -1947,7 +1983,7 @@ class Database(Generic[N, V]):
             query_data,
             target_to_query,
             masks,
-            deadline,
+            budget,
         )
         if refined is None:
             return []
@@ -1963,7 +1999,7 @@ class Database(Generic[N, V]):
             variable_state[1],
             results,
             match_limit,
-            deadline,
+            budget,
         )
         return results
 
@@ -1988,6 +2024,7 @@ class Database(Generic[N, V]):
         self,
         stored: _StoredGraph[N, V],
         query_data: _QueryData[N, V],
+        budget: _OperationBudget | None = None,
     ) -> tuple[list[N], list[N], dict[N, int], list[list[int]]] | None:
         masks = self._initial_single_graph_masks(
             stored,
@@ -1996,6 +2033,7 @@ class Database(Generic[N, V]):
             set(),
             {},
             {},
+            budget,
         )
         if masks is None:
             return None
@@ -2005,7 +2043,7 @@ class Database(Generic[N, V]):
             query_data,
             {},
             masks,
-            None,
+            budget,
         )
         if refined is None:
             return None
@@ -2045,6 +2083,7 @@ class Database(Generic[N, V]):
         query_data: _QueryData[N, V],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         try:
+            budget = _OperationBudget(self._anchored_ops)
             masks = self._initial_single_graph_masks(
                 stored,
                 query_data,
@@ -2052,7 +2091,7 @@ class Database(Generic[N, V]):
                 set(),
                 {},
                 {},
-                None,
+                budget,
             )
             if masks is None:
                 return None
@@ -2062,7 +2101,7 @@ class Database(Generic[N, V]):
                 query_data,
                 {},
                 masks,
-                None,
+                budget,
             )
             if refined is None:
                 return None
@@ -2080,7 +2119,7 @@ class Database(Generic[N, V]):
                 {},
                 anchor_targets,
                 0,
-                time.monotonic() + 6.0,
+                budget,
             )
         except _SearchTimeout:
             return None
@@ -2095,10 +2134,9 @@ class Database(Generic[N, V]):
         used_query_identifiers: dict[VariableClass, set[V]],
         anchor_targets: tuple[N, ...],
         anchor_index: int,
-        deadline: float,
+        budget: _OperationBudget,
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
-        if time.monotonic() >= deadline:
-            return None
+        _spend(budget)
 
         if anchor_index >= len(anchor_targets):
             variable_state = self._copy_variable_state(target_var_to_query_identifier, used_query_identifiers)
@@ -2110,7 +2148,7 @@ class Database(Generic[N, V]):
                     dict(masks),
                     variable_state[0],
                     variable_state[1],
-                    min(deadline, time.monotonic() + 0.5),
+                    budget,
                 )
             except _SearchTimeout:
                 return None
@@ -2126,7 +2164,7 @@ class Database(Generic[N, V]):
                 used_query_identifiers,
                 anchor_targets,
                 anchor_index + 1,
-                deadline,
+                budget,
             )
 
         candidate_indices = list(_iter_mask_indices(masks[target_node]))
@@ -2141,8 +2179,7 @@ class Database(Generic[N, V]):
         )
 
         for query_index in candidate_indices:
-            if time.monotonic() >= deadline:
-                return None
+            _spend(budget)
             query_node = query_data.index_to_node[query_index]
             next_target_to_query = dict(target_to_query)
             next_target_to_query[target_node] = query_node
@@ -2158,7 +2195,7 @@ class Database(Generic[N, V]):
                 query_index,
                 target_var_to_query_identifier,
                 used_query_identifiers,
-                deadline,
+                budget,
             )
             if propagated is None:
                 continue
@@ -2173,7 +2210,7 @@ class Database(Generic[N, V]):
                 next_used_query_identifiers,
                 anchor_targets,
                 anchor_index + 1,
-                deadline,
+                budget,
             )
             if match is not None:
                 return match
@@ -2188,7 +2225,11 @@ class Database(Generic[N, V]):
         if not self._z3_enabled or z3 is None:
             return None
 
-        solver_candidates = self._refined_solver_candidates(stored, query_data)
+        solver_candidates = self._refined_solver_candidates(
+            stored,
+            query_data,
+            _OperationBudget(self._native_ops),
+        )
         if solver_candidates is None:
             return None
         return self._find_single_graph_match_z3_from_candidates(stored, query_data, solver_candidates)
@@ -2216,7 +2257,7 @@ class Database(Generic[N, V]):
         order, query_nodes, target_position, candidates = solver_candidates
 
         solver = z3m.Solver()
-        solver.set(timeout=10_000)
+        solver.set(rlimit=self._z3_rlimit)
 
         assignment_variables: dict[tuple[int, int], Any] = {
             (target_index, query_index): z3m.Bool(f"x_{target_index}_{query_index}")
@@ -2321,10 +2362,14 @@ class Database(Generic[N, V]):
         stored: _StoredGraph[N, V],
         query_data: _QueryData[N, V],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
-        if cp_model is None:
+        if not self._ortools_enabled or cp_model is None:
             return None
 
-        solver_candidates = self._refined_solver_candidates(stored, query_data)
+        solver_candidates = self._refined_solver_candidates(
+            stored,
+            query_data,
+            _OperationBudget(self._native_ops),
+        )
         if solver_candidates is None:
             return None
         return self._find_single_graph_match_ortools_from_candidates(stored, query_data, solver_candidates)
@@ -2335,7 +2380,7 @@ class Database(Generic[N, V]):
         query_data: _QueryData[N, V],
         masks: dict[N, int],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
-        if cp_model is None:
+        if not self._ortools_enabled or cp_model is None:
             return None
         solver_candidates = self._solver_candidates_from_masks(stored, query_data, masks)
         if solver_candidates is None:
@@ -2420,7 +2465,7 @@ class Database(Generic[N, V]):
                         )
 
         solver: Any = cp.CpSolver()
-        solver.parameters.max_time_in_seconds = 5.0
+        solver.parameters.max_deterministic_time = self._ortools_deterministic_time
         solver.parameters.num_search_workers = 8
         status = solver.Solve(model)
         if status not in (cp.OPTIMAL, cp.FEASIBLE):
@@ -2446,10 +2491,9 @@ class Database(Generic[N, V]):
         masks: dict[N, int],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
-        deadline: float | None = None,
+        budget: _OperationBudget | None = None,
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
-        if deadline is not None and time.monotonic() >= deadline:
-            raise _SearchTimeout
+        _spend(budget)
         if len(target_to_query) == len(stored.order):
             ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
             if not _conditions_hold(stored.full_conditions, ordered_query_nodes, query_data.node_ranks):
@@ -2473,7 +2517,7 @@ class Database(Generic[N, V]):
         )
 
         candidate_indices: Iterator[int]
-        if deadline is None:
+        if budget is None:
             candidate_indices = iter(
                 sorted(
                     _iter_mask_indices(masks[target_node]),
@@ -2484,8 +2528,7 @@ class Database(Generic[N, V]):
             candidate_indices = _iter_mask_indices(masks[target_node])
 
         for query_index in candidate_indices:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise _SearchTimeout
+            _spend(budget)
             query_node = query_data.index_to_node[query_index]
             next_target_to_query = dict(target_to_query)
             next_target_to_query[target_node] = query_node
@@ -2501,7 +2544,7 @@ class Database(Generic[N, V]):
                 query_index,
                 target_var_to_query_identifier,
                 used_query_identifiers,
-                deadline,
+                budget,
             )
             if propagated is None:
                 continue
@@ -2514,7 +2557,7 @@ class Database(Generic[N, V]):
                 next_masks,
                 next_target_var_to_query_identifier,
                 next_used_query_identifiers,
-                deadline,
+                budget,
             )
             if match is not None:
                 return match
@@ -2531,12 +2574,11 @@ class Database(Generic[N, V]):
         used_query_identifiers: dict[VariableClass, set[V]],
         results: list[tuple[NodeMapping[N], VariableMapping[V]]],
         match_limit: int,
-        deadline: float | None = None,
+        budget: _OperationBudget | None = None,
     ) -> None:
         if len(results) >= match_limit:
             return
-        if deadline is not None and time.monotonic() >= deadline:
-            raise _SearchTimeout
+        _spend(budget)
         if len(target_to_query) == len(stored.order):
             ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
             if _conditions_hold(stored.full_conditions, ordered_query_nodes, query_data.node_ranks):
@@ -2566,8 +2608,7 @@ class Database(Generic[N, V]):
         for query_index in candidate_indices:
             if len(results) >= match_limit:
                 return
-            if deadline is not None and time.monotonic() >= deadline:
-                raise _SearchTimeout
+            _spend(budget)
             query_node = query_data.index_to_node[query_index]
             next_target_to_query = dict(target_to_query)
             next_target_to_query[target_node] = query_node
@@ -2583,7 +2624,7 @@ class Database(Generic[N, V]):
                 query_index,
                 target_var_to_query_identifier,
                 used_query_identifiers,
-                deadline,
+                budget,
             )
             if propagated is None:
                 continue
@@ -2598,7 +2639,7 @@ class Database(Generic[N, V]):
                 next_used_query_identifiers,
                 results,
                 match_limit,
-                deadline,
+                budget,
             )
 
     def _dynamic_label_candidates(
