@@ -1,7 +1,7 @@
 gLabVarTrie
 ===========
 
-An extension of `gLabTrie: A Data Structure for Motif Discovery with Constraints` to also handle variables. Variables in this context refers to the idea that some labels can be renamed as long as they are renamed along with the rest of the instances of that variable.
+An extension of `gLabTrie: A Data Structure for Motif Discovery with Constraints` to also handle variables. Variables in this context refers to the idea that in addition to a label, nodes also have an ordered list of variables which need to be consistently renamed across the graph to match a subgraph.
 
 ### Warning
 
