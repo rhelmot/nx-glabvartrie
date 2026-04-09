@@ -48,13 +48,17 @@ def random_connected_graph(r: Random, nodes: range, labels: range, variables: ra
 
 def is_valid_match(
     target_graph: nx.DiGraph[int],
+    target_ident: int,
     query_graph: nx.DiGraph[int],
     node_mapping: dict[int, int],
     variable_mapping: Mapping[int, Mapping[int, int]],
+    found_idents: set[int],
 ) -> bool:
     if set(node_mapping) != set(target_graph.nodes):
         return False
     if len(set(node_mapping.values())) != len(node_mapping):
+        return False
+    if target_ident not in found_idents:
         return False
 
     computed_variable_mapping: defaultdict[int, dict[int, int]] = defaultdict(dict)
@@ -118,7 +122,7 @@ class TestRegressions(unittest.TestCase):
         target.add_node(2, label=32, vars=(0,))
         target.add_node(0, label=5, vars=(3,))
         target.add_edges_from([(1, 0), (1, 2), (1, 3)])
-        d.index(target)
+        d.index(target, 999)
 
         query = nx.DiGraph()
         query.add_node(100, label=(3, ()), vars=())
@@ -129,10 +133,9 @@ class TestRegressions(unittest.TestCase):
 
         result = list(d.query(query))
 
-        self.assertEqual(len(result), 1)
-        found_graph, found_node_mapping, found_var_mapping = result[0]
-        self.assertIs(found_graph, target)
-        self.assertTrue(is_valid_match(target, query, found_node_mapping, found_var_mapping))
+        assert len(result) == 1
+        _, found_node_mapping, found_var_mapping, found_idents = result[0]
+        assert is_valid_match(target, 999, query, found_node_mapping, found_var_mapping, found_idents)
 
 
 FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
@@ -147,13 +150,13 @@ class TestFuzz(unittest.TestCase):
 
         for i in range(FUZZ_OFFSET, FUZZ_OFFSET + FUZZ_COUNT):
             r = Random(i)
-            d: Database[int, int, int] = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+            d: Database[int, int, int, int] = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
 
-            for _ in range(r.randrange(100)):
-                d.index(rcg(r))
+            for ident in range(r.randrange(100)):
+                d.index(rcg(r), ident)
             targets = [rcg(r) for _ in range(r.randrange(1, 5))]
-            for t in targets:
-                d.index(t)
+            for ident, t in enumerate(targets):
+                d.index(t, ident + 100)
 
             needed_nodes = sum(len(t) for t in targets)
             query = rcg(r, r.randrange(needed_nodes, needed_nodes * 10))
@@ -165,9 +168,9 @@ class TestFuzz(unittest.TestCase):
                 embed_graph(query, t, available_nodes, variables)
 
             result = list(d.query(query))
-            for target_graph in targets:
-                for found_graph, found_node_mapping, found_var_mapping in result:
-                    if target_graph is found_graph and is_valid_match(target_graph, query, found_node_mapping, found_var_mapping):
+            for target_ident, target_graph in enumerate(targets):
+                for _, found_node_mapping, found_var_mapping, found_idents in result:
+                    if is_valid_match(target_graph, target_ident + 100, query, found_node_mapping, found_var_mapping, found_idents):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"
@@ -191,11 +194,11 @@ class TestFuzz(unittest.TestCase):
             d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
             label_start = 0
 
-            for _ in range(r.randrange(100)):
-                d.index(rcg(r))
+            for ident in range(r.randrange(100)):
+                d.index(rcg(r), ident)
             targets = [rcg(r) for _ in range(r.randrange(1, 5))]
-            for t in targets:
-                d.index(t)
+            for ident, t in enumerate(targets):
+                d.index(t, ident + 100)
 
             needed_nodes = sum(len(t) for t in targets)
             query = rcg(r, r.randrange(needed_nodes, needed_nodes * 10))
@@ -207,9 +210,9 @@ class TestFuzz(unittest.TestCase):
                 embed_graph(query, t, available_nodes, variables)
 
             result = list(d.query(query))
-            for target_graph in targets:
-                for found_graph, found_node_mapping, found_var_mapping in result:
-                    if target_graph is found_graph and is_valid_match(target_graph, query, found_node_mapping, found_var_mapping):
+            for target_ident, target_graph in enumerate(targets):
+                for _, found_node_mapping, found_var_mapping, found_idents in result:
+                    if is_valid_match(target_graph, target_ident + 100, query, found_node_mapping, found_var_mapping, found_idents):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"
@@ -231,11 +234,11 @@ class TestFuzz(unittest.TestCase):
             r = Random(i)
             d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
 
-            for _ in range(r.randrange(500, 2001)):
-                d.index(rcg(r))
+            for ident in range(r.randrange(500, 2000)):
+                d.index(rcg(r), ident)
             targets = [rcg(r) for _ in range(r.randrange(1, 5))]
-            for t in targets:
-                d.index(t)
+            for ident, t in enumerate(targets):
+                d.index(t, ident + 2000)
 
             needed_nodes = sum(len(t) for t in targets)
             query = random_connected_graph(
@@ -254,9 +257,9 @@ class TestFuzz(unittest.TestCase):
                 embed_graph(query, t, available_nodes, variables)
 
             result = list(d.query(query))
-            for target_graph in targets:
-                for found_graph, found_node_mapping, found_var_mapping in result:
-                    if target_graph is found_graph and is_valid_match(target_graph, query, found_node_mapping, found_var_mapping):
+            for target_ident, target_graph in enumerate(targets):
+                for _, found_node_mapping, found_var_mapping, found_idents in result:
+                    if is_valid_match(target_graph, target_ident + 2000, query, found_node_mapping, found_var_mapping, found_idents):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"

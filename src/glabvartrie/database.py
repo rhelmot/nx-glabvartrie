@@ -19,11 +19,13 @@ except Exception:
 N = TypeVar("N", bound=Hashable)
 L = TypeVar("L", bound=Hashable)
 V = TypeVar("V", bound=Hashable)
+I = TypeVar("I", bound=Hashable)
 VariableClass: TypeAlias = int
 Label: TypeAlias = L
 Variables: TypeAlias = tuple[V, ...]
 NodeMapping: TypeAlias = dict[N, N]
 VariableMapping: TypeAlias = dict[VariableClass, dict[V, V]]
+MatchResult: TypeAlias = tuple["nx.DiGraph[N]", NodeMapping[N], VariableMapping[V], set[I]]
 
 
 def _env_enabled(name: str, default: bool) -> bool:
@@ -691,11 +693,12 @@ def _build_query_data(
     )
 
 
-class Database(Generic[N, L, V]):
+class Database(Generic[N, L, V, I]):
     def __init__(self, node_label: Callable[[dict[str, Any]], L], node_vars: Callable[[dict[str, Any]], Variables[V]]):
         self._node_label = node_label
         self._node_vars = node_vars
         self._graphs: list[_StoredGraph[N, L, V]] = []
+        self._idents: list[set[I]] = []
         self._root = _TrieNode(depth=0, topology_pattern=None)
         self._heuristic_fallbacks_enabled = _env_enabled("GLABVARTRIE_ENABLE_HEURISTIC_FALLBACKS", True)
         self._ortools_enabled = _env_enabled("GLABVARTRIE_ENABLE_ORTOOLS", True) and cp_model is not None
@@ -772,12 +775,13 @@ class Database(Generic[N, L, V]):
             future_in_positions=tuple(tuple(positions) for positions in future_in_positions_mut),
         )
 
-    def index(self, g: nx.DiGraph[N]) -> None:
+    def index(self, g: nx.DiGraph[N], ident: I) -> None:
         labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
         variables = {node: self._node_vars(g.nodes[node]) for node in g.nodes}
         stored = self._build_stored_graph(g, labels, variables)
         graph_index = len(self._graphs)
         self._graphs.append(stored)
+        self._idents.append({ident})
 
         node = self._root
         node.descendant_graph_indices.add(graph_index)
@@ -795,10 +799,7 @@ class Database(Generic[N, L, V]):
         if node.full_conditions is None:
             node.full_conditions = stored.full_conditions
 
-    def update(self, g: nx.DiGraph[N]) -> None:
-        self.index(g)
-
-    def query(self, g: nx.DiGraph[N]) -> list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]]:
+    def query(self, g: nx.DiGraph[N]) -> list[MatchResult[N, V, I]]:
         query_labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
         query_variables = {node: self._node_vars(g.nodes[node]) for node in g.nodes}
         query_data = _build_query_data(g, query_labels, query_variables)
@@ -814,7 +815,7 @@ class Database(Generic[N, L, V]):
         if len(eligible) <= 16:
             return self._query_direct(query_data, eligible)
 
-        matches: list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]] = []
+        matches: list[MatchResult[N, V, I]] = []
         used_query_nodes: set[N] = set()
         matched_query_nodes: list[N] = []
 
@@ -829,8 +830,8 @@ class Database(Generic[N, L, V]):
         self,
         query_data: _QueryData[N, L, V],
         eligible: set[int],
-    ) -> list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]]:
-        matches: list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]] = []
+    ) -> list[MatchResult[N, V, I]]:
+        matches: list[MatchResult[N, V, I]] = []
         remaining = set(eligible)
 
         graph_order = sorted(
@@ -886,7 +887,7 @@ class Database(Generic[N, L, V]):
         graph_index: int,
         query_data: _QueryData[N, L, V],
         eligible: set[int],
-        matches: list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]],
+        matches: list[MatchResult[N, V, I]],
         match_limit: int,
         use_lookahead: bool,
     ) -> int:
@@ -921,7 +922,7 @@ class Database(Generic[N, L, V]):
             if match is not None:
                 local_matches.append(match)
         for node_mapping, variable_mapping in local_matches:
-            matches.append((stored.graph, node_mapping, variable_mapping))
+            self._append_match(matches, graph_index, node_mapping, variable_mapping)
 
         if local_matches:
             eligible.discard(graph_index)
@@ -942,6 +943,35 @@ class Database(Generic[N, L, V]):
                 for variable_class, identifiers in used_query_identifiers.items()
             },
         )
+
+    def _match_signature(
+        self,
+        node_mapping: NodeMapping[N],
+        variable_mapping: VariableMapping[V],
+    ) -> tuple[tuple[tuple[N, N], ...], tuple[tuple[VariableClass, tuple[tuple[V, V], ...]], ...]]:
+        return (
+            tuple(sorted(node_mapping.items(), key=lambda item: repr(item[0]))),
+            tuple(
+                (variable_class, tuple(sorted(identifier_mapping.items(), key=lambda item: repr(item[0]))))
+                for variable_class, identifier_mapping in sorted(variable_mapping.items(), key=lambda item: item[0])
+            ),
+        )
+
+    def _append_match(
+        self,
+        matches: list[MatchResult[N, V, I]],
+        graph_index: int,
+        node_mapping: NodeMapping[N],
+        variable_mapping: VariableMapping[V],
+    ) -> None:
+        signature = self._match_signature(node_mapping, variable_mapping)
+        for match_index, (graph, existing_node_mapping, existing_variable_mapping, identifiers) in enumerate(matches):
+            del graph
+            if self._match_signature(existing_node_mapping, existing_variable_mapping) != signature:
+                continue
+            identifiers.update(self._idents[graph_index])
+            return
+        matches.append((self._graphs[graph_index].graph, node_mapping, variable_mapping, set(self._idents[graph_index])))
 
     def _timeout_fallback_match(
         self,
@@ -1223,7 +1253,7 @@ class Database(Generic[N, L, V]):
         eligible: set[int],
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
-        matches: list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]],
+        matches: list[MatchResult[N, V, I]],
         candidate_plan: list[tuple[N, frozenset[int]]] | None = None,
     ) -> None:
         active_graphs = node.descendant_graph_indices & eligible
@@ -1268,7 +1298,12 @@ class Database(Generic[N, L, V]):
                             target_node: matched_query_nodes[position]
                             for position, target_node in enumerate(stored.order)
                         }
-                        matches.append((stored.graph, target_to_query, self._variable_mapping(stored, query_data, matched_query_nodes)))
+                        self._append_match(
+                            matches,
+                            graph_index,
+                            target_to_query,
+                            self._variable_mapping(stored, query_data, matched_query_nodes),
+                        )
                         eligible.discard(graph_index)
 
                 remaining_active = set(next_active_graphs & eligible)
@@ -1317,7 +1352,7 @@ class Database(Generic[N, L, V]):
         eligible: set[int],
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
-        matches: list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]],
+        matches: list[MatchResult[N, V, I]],
         candidate_plan: list[tuple[N, frozenset[int]]] | None = None,
     ) -> bool:
         del position
@@ -1346,7 +1381,7 @@ class Database(Generic[N, L, V]):
             match = self._timeout_fallback_match(stored, query_data)
         if match is not None:
             node_mapping, variable_mapping = match
-            matches.append((stored.graph, node_mapping, variable_mapping))
+            self._append_match(matches, graph_index, node_mapping, variable_mapping)
             eligible.discard(graph_index)
             return True
 
