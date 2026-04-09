@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
 import os
-from typing import Any, Callable, Generic, Hashable, Iterator, TypeVar
+from typing import Any, Callable, Generic, Hashable, Iterator, TypeAlias, TypeVar
 
 import networkx as nx
 try:
@@ -17,11 +17,13 @@ except Exception:
     z3 = None
 
 N = TypeVar("N", bound=Hashable)
+L = TypeVar("L", bound=Hashable)
 V = TypeVar("V", bound=Hashable)
-VariableClass = Hashable
-Label = tuple[VariableClass | None, V]
-NodeMapping = dict[N, N]
-VariableMapping = dict[VariableClass, dict[V, V]]
+VariableClass: TypeAlias = int
+Label: TypeAlias = L
+Variables: TypeAlias = tuple[V, ...]
+NodeMapping: TypeAlias = dict[N, N]
+VariableMapping: TypeAlias = dict[VariableClass, dict[V, V]]
 
 
 def _env_enabled(name: str, default: bool) -> bool:
@@ -77,14 +79,14 @@ def _spend(budget: _OperationBudget | None, cost: int = 1) -> None:
         budget.spend(cost)
 
 
-def _label_stats(labels: dict[N, Label[V]]) -> tuple[Counter[V], dict[VariableClass, tuple[int, ...]]]:
-    constant_counts: Counter[V] = Counter()
+def _label_stats(labels: dict[N, L], variables: dict[N, Variables[V]]) -> tuple[Counter[L], dict[VariableClass, tuple[int, ...]]]:
+    constant_counts: Counter[L] = Counter()
     variable_groups: defaultdict[VariableClass, Counter[V]] = defaultdict(Counter)
 
-    for variable_class, identifier in labels.values():
-        if variable_class is None:
-            constant_counts[identifier] += 1
-        else:
+    for node_label in labels.values():
+        constant_counts[node_label] += 1
+    for node_variables in variables.values():
+        for variable_class, identifier in enumerate(node_variables):
             variable_groups[variable_class][identifier] += 1
 
     variable_group_sizes = {
@@ -174,7 +176,7 @@ def _articulation_points(neighbours: tuple[tuple[int, ...], ...], remaining: fro
     return frozenset(articulation_points)
 
 
-def _topology_order(graph: nx.DiGraph[N], labels: dict[N, Label[V]]) -> tuple[N, ...]:
+def _topology_order(graph: nx.DiGraph[N], labels: dict[N, L]) -> tuple[N, ...]:
     del labels
 
     nodes = tuple(graph.nodes)
@@ -246,12 +248,9 @@ class _TopologyPattern:
 
 
 @dataclass(frozen=True, slots=True)
-class _LabelPattern(Generic[V]):
-    kind: str
-    constant_identifier: V | None = None
-    variable_class: VariableClass | None = None
-    repeated_from: int | None = None
-    same_class_previous: tuple[int, ...] = ()
+class _LabelPattern(Generic[L]):
+    node_label: L
+    repeated_from: tuple[int | None, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,39 +282,29 @@ def _topology_patterns_for_order(graph: nx.DiGraph[N], order: tuple[N, ...]) -> 
     return tuple(patterns)
 
 
-def _label_patterns_for_order(labels: dict[N, Label[V]], order: tuple[N, ...]) -> tuple[_LabelPattern[V], ...]:
-    label_patterns: list[_LabelPattern[V]] = []
+def _label_patterns_for_order(
+    labels: dict[N, L],
+    variables: dict[N, Variables[V]],
+    order: tuple[N, ...],
+) -> tuple[_LabelPattern[L], ...]:
+    label_patterns: list[_LabelPattern[L]] = []
     first_variable_position: dict[tuple[VariableClass, V], int] = {}
-    previous_by_class: defaultdict[VariableClass, list[int]] = defaultdict(list)
 
-    for position, node in enumerate(order):
-        variable_class, identifier = labels[node]
-        if variable_class is None:
-            label_patterns.append(_LabelPattern(kind="const", constant_identifier=identifier))
-            continue
-
-        key = (variable_class, identifier)
-        repeated_from = first_variable_position.get(key)
-        if repeated_from is not None:
-            label_patterns.append(
-                _LabelPattern(
-                    kind="var-repeat",
-                    variable_class=variable_class,
-                    repeated_from=repeated_from,
-                )
-            )
-            previous_by_class[variable_class].append(position)
-            continue
-
-        first_variable_position[key] = position
+    for node in order:
+        node_variables = variables[node]
+        actual_repeated_from: list[int | None] = []
+        for variable_class, identifier in enumerate(node_variables):
+            key = (variable_class, identifier)
+            first_position = first_variable_position.get(key)
+            actual_repeated_from.append(first_position)
+            if first_position is None:
+                first_variable_position[key] = len(label_patterns)
         label_patterns.append(
             _LabelPattern(
-                kind="var-new",
-                variable_class=variable_class,
-                same_class_previous=tuple(previous_by_class[variable_class]),
+                node_label=labels[node],
+                repeated_from=tuple(actual_repeated_from),
             )
         )
-        previous_by_class[variable_class].append(position)
 
     return tuple(label_patterns)
 
@@ -541,12 +530,13 @@ def _reduce_conditions(conditions: tuple[tuple[int, int], ...]) -> tuple[tuple[i
 def _symmetry_conditions(
     graph: nx.DiGraph[N],
     order: tuple[N, ...],
-    labels: dict[N, Label[V]],
+    labels: dict[N, L],
+    variables: dict[N, Variables[V]],
 ) -> tuple[tuple[int, int], ...]:
     adjacency, neighbours, neighbour_counts = _position_graph(graph, order)
     color_classes = _refined_color_classes(
         adjacency,
-        tuple(labels[node] for node in order),
+        tuple((labels[node], variables[node]) for node in order),
     )
     if all(len(color_class) == 1 for color_class in color_classes):
         return ()
@@ -577,10 +567,11 @@ def _symmetry_conditions(
 
 
 @dataclass(slots=True)
-class _StoredGraph(Generic[N, V]):
+class _StoredGraph(Generic[N, L, V]):
     graph: nx.DiGraph[N]
-    labels: dict[N, Label[V]]
-    constant_counts: Counter[V]
+    labels: dict[N, L]
+    variables: dict[N, Variables[V]]
+    constant_counts: Counter[L]
     variable_group_sizes: dict[VariableClass, tuple[int, ...]]
     in_degrees: dict[N, int]
     out_degrees: dict[N, int]
@@ -592,7 +583,7 @@ class _StoredGraph(Generic[N, V]):
     variable_key_nodes: dict[tuple[VariableClass, V], tuple[N, ...]]
     variable_class_nodes: dict[VariableClass, tuple[N, ...]]
     topology_patterns: tuple[_TopologyPattern, ...]
-    label_patterns: tuple[_LabelPattern[V], ...]
+    label_patterns: tuple[_LabelPattern[L], ...]
     condition_options: tuple[_ConditionOption, ...]
     full_conditions: tuple[tuple[int, int], ...]
     future_out_positions: tuple[tuple[int, ...], ...]
@@ -612,20 +603,19 @@ class _TrieNode:
 
 
 @dataclass(slots=True)
-class _QueryData(Generic[N, V]):
+class _QueryData(Generic[N, L, V]):
     graph: nx.DiGraph[N]
-    labels: dict[N, Label[V]]
-    constant_nodes: dict[V, frozenset[N]]
-    constant_masks: dict[V, int]
-    variable_nodes: dict[VariableClass, frozenset[N]]
-    variable_masks: dict[VariableClass, int]
+    labels: dict[N, L]
+    variables: dict[N, Variables[V]]
+    constant_nodes: dict[L, frozenset[N]]
+    constant_masks: dict[L, int]
     variable_identifier_nodes: dict[tuple[VariableClass, V], frozenset[N]]
     variable_identifier_masks: dict[tuple[VariableClass, V], int]
     predecessors: dict[N, frozenset[N]]
     predecessor_masks: tuple[int, ...]
     successors: dict[N, frozenset[N]]
     successor_masks: tuple[int, ...]
-    constant_counts: Counter[V]
+    constant_counts: Counter[L]
     variable_group_sizes: dict[VariableClass, tuple[int, ...]]
     in_degrees: dict[N, int]
     out_degrees: dict[N, int]
@@ -642,20 +632,21 @@ class _DynamicSearchState(Generic[N, V]):
     target_var_to_query_identifier: dict[VariableClass, dict[V, V]]
     used_query_identifiers: dict[VariableClass, set[V]]
 
-
-def _build_query_data(graph: nx.DiGraph[N], labels: dict[N, Label[V]]) -> _QueryData[N, V]:
-    constant_nodes_mut: defaultdict[V, set[N]] = defaultdict(set)
-    variable_nodes_mut: defaultdict[VariableClass, set[N]] = defaultdict(set)
+def _build_query_data(
+    graph: nx.DiGraph[N],
+    labels: dict[N, L],
+    variables: dict[N, Variables[V]],
+) -> _QueryData[N, L, V]:
+    constant_nodes_mut: defaultdict[L, set[N]] = defaultdict(set)
     variable_identifier_nodes_mut: defaultdict[tuple[VariableClass, V], set[N]] = defaultdict(set)
     index_to_node = tuple(graph.nodes)
     node_indices = {node: index for index, node in enumerate(index_to_node)}
     all_nodes_mask = (1 << len(index_to_node)) - 1
 
-    for node, (variable_class, identifier) in labels.items():
-        if variable_class is None:
-            constant_nodes_mut[identifier].add(node)
-        else:
-            variable_nodes_mut[variable_class].add(node)
+    for node, node_label in labels.items():
+        constant_nodes_mut[node_label].add(node)
+    for node, node_variables in variables.items():
+        for variable_class, identifier in enumerate(node_variables):
             variable_identifier_nodes_mut[(variable_class, identifier)].add(node)
 
     def mask_for_nodes(nodes: set[N]) -> int:
@@ -664,14 +655,13 @@ def _build_query_data(graph: nx.DiGraph[N], labels: dict[N, Label[V]]) -> _Query
             mask |= 1 << node_indices[node]
         return mask
 
-    constant_counts, variable_group_sizes = _label_stats(labels)
+    constant_counts, variable_group_sizes = _label_stats(labels, variables)
     return _QueryData(
         graph=graph,
         labels=labels,
+        variables=variables,
         constant_nodes={identifier: frozenset(nodes) for identifier, nodes in constant_nodes_mut.items()},
         constant_masks={identifier: mask_for_nodes(nodes) for identifier, nodes in constant_nodes_mut.items()},
-        variable_nodes={variable_class: frozenset(nodes) for variable_class, nodes in variable_nodes_mut.items()},
-        variable_masks={variable_class: mask_for_nodes(nodes) for variable_class, nodes in variable_nodes_mut.items()},
         variable_identifier_nodes={
             key: frozenset(nodes)
             for key, nodes in variable_identifier_nodes_mut.items()
@@ -701,10 +691,11 @@ def _build_query_data(graph: nx.DiGraph[N], labels: dict[N, Label[V]]) -> _Query
     )
 
 
-class Database(Generic[N, V]):
-    def __init__(self, node_label: Callable[[dict[str, Any]], Label[V]]):
+class Database(Generic[N, L, V]):
+    def __init__(self, node_label: Callable[[dict[str, Any]], L], node_vars: Callable[[dict[str, Any]], Variables[V]]):
         self._node_label = node_label
-        self._graphs: list[_StoredGraph[N, V]] = []
+        self._node_vars = node_vars
+        self._graphs: list[_StoredGraph[N, L, V]] = []
         self._root = _TrieNode(depth=0, topology_pattern=None)
         self._heuristic_fallbacks_enabled = _env_enabled("GLABVARTRIE_ENABLE_HEURISTIC_FALLBACKS", True)
         self._ortools_enabled = _env_enabled("GLABVARTRIE_ENABLE_ORTOOLS", True) and cp_model is not None
@@ -715,7 +706,7 @@ class Database(Generic[N, V]):
         self._z3_rlimit = _env_int("GLABVARTRIE_Z3_RLIMIT", 5_000_000)
         self._ortools_deterministic_time = _env_float("GLABVARTRIE_ORTOOLS_DETERMINISTIC_TIME", 0.2)
 
-    def _native_budget(self, stored: _StoredGraph[N, V]) -> _OperationBudget | None:
+    def _native_budget(self, stored: _StoredGraph[N, L, V]) -> _OperationBudget | None:
         if stored.graph.number_of_nodes() < 50:
             return None
         if not (self._heuristic_fallbacks_enabled or self._ortools_enabled or self._z3_enabled):
@@ -725,22 +716,21 @@ class Database(Generic[N, V]):
     def _build_stored_graph(
         self,
         g: nx.DiGraph[N],
-        labels: dict[N, Label[V]],
-    ) -> _StoredGraph[N, V]:
+        labels: dict[N, L],
+        variables: dict[N, Variables[V]],
+    ) -> _StoredGraph[N, L, V]:
         order = _topology_order(g, labels)
         topology_patterns = _topology_patterns_for_order(g, order)
-        label_patterns = _label_patterns_for_order(labels, order)
-        conditions = _symmetry_conditions(g, order, labels)
-        constant_counts, variable_group_sizes = _label_stats(labels)
+        label_patterns = _label_patterns_for_order(labels, variables, order)
+        conditions = _symmetry_conditions(g, order, labels, variables)
+        constant_counts, variable_group_sizes = _label_stats(labels, variables)
         order_positions = {node: position for position, node in enumerate(order)}
         variable_key_nodes_mut: defaultdict[tuple[VariableClass, V], list[N]] = defaultdict(list)
         variable_class_nodes_mut: defaultdict[VariableClass, list[N]] = defaultdict(list)
         for node in order:
-            variable_class, identifier = labels[node]
-            if variable_class is None:
-                continue
-            variable_key_nodes_mut[(variable_class, identifier)].append(node)
-            variable_class_nodes_mut[variable_class].append(node)
+            for variable_class, identifier in enumerate(variables[node]):
+                variable_key_nodes_mut[(variable_class, identifier)].append(node)
+                variable_class_nodes_mut[variable_class].append(node)
 
         future_out_positions_mut: list[list[int]] = [[] for _ in order]
         future_in_positions_mut: list[list[int]] = [[] for _ in order]
@@ -753,6 +743,7 @@ class Database(Generic[N, V]):
         return _StoredGraph(
             graph=g,
             labels=labels,
+            variables=variables,
             constant_counts=constant_counts,
             variable_group_sizes=variable_group_sizes,
             in_degrees=dict(g.in_degree()),
@@ -783,7 +774,8 @@ class Database(Generic[N, V]):
 
     def index(self, g: nx.DiGraph[N]) -> None:
         labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
-        stored = self._build_stored_graph(g, labels)
+        variables = {node: self._node_vars(g.nodes[node]) for node in g.nodes}
+        stored = self._build_stored_graph(g, labels, variables)
         graph_index = len(self._graphs)
         self._graphs.append(stored)
 
@@ -808,7 +800,8 @@ class Database(Generic[N, V]):
 
     def query(self, g: nx.DiGraph[N]) -> list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]]:
         query_labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
-        query_data = _build_query_data(g, query_labels)
+        query_variables = {node: self._node_vars(g.nodes[node]) for node in g.nodes}
+        query_data = _build_query_data(g, query_labels, query_variables)
 
         eligible = {
             index
@@ -834,7 +827,7 @@ class Database(Generic[N, V]):
 
     def _query_direct(
         self,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         eligible: set[int],
     ) -> list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]]:
         matches: list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]] = []
@@ -863,8 +856,8 @@ class Database(Generic[N, V]):
 
     def _direct_graph_priority(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[int, int, str]:
         root_target = min(
             stored.order,
@@ -891,7 +884,7 @@ class Database(Generic[N, V]):
     def _collect_single_graph_matches(
         self,
         graph_index: int,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         eligible: set[int],
         matches: list[tuple[nx.DiGraph[N], NodeMapping[N], VariableMapping[V]]],
         match_limit: int,
@@ -952,8 +945,8 @@ class Database(Generic[N, V]):
 
     def _timeout_fallback_match(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         if stored.graph.number_of_nodes() < 50:
             return None
@@ -974,17 +967,18 @@ class Database(Generic[N, V]):
 
     def _stored_subgraph(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         nodes: frozenset[N],
-    ) -> _StoredGraph[N, V]:
+    ) -> _StoredGraph[N, L, V]:
         subgraph = nx.DiGraph(stored.graph.subgraph(nodes))
         sublabels = {node: stored.labels[node] for node in subgraph.nodes}
-        return self._build_stored_graph(subgraph, sublabels)
+        subvars = {node: stored.variables[node] for node in subgraph.nodes}
+        return self._build_stored_graph(subgraph, sublabels, subvars)
 
     def _find_single_graph_match_scc_decomposed(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         sccs = [frozenset(component) for component in nx.strongly_connected_components(stored.graph)]
         if len(sccs) <= 1:
@@ -1003,13 +997,13 @@ class Database(Generic[N, V]):
             if source_component != target_component:
                 condensation.add_edge(source_component, target_component)
         budget = _OperationBudget(self._scc_ops)
-        subgraph_cache: dict[frozenset[N], _StoredGraph[N, V]] = {}
+        subgraph_cache: dict[frozenset[N], _StoredGraph[N, L, V]] = {}
 
         def component_setup(
             component_id: int,
             target_to_query: dict[N, N],
         ) -> tuple[
-            _StoredGraph[N, V],
+            _StoredGraph[N, L, V],
             tuple[N, ...],
             dict[N, N],
             set[N],
@@ -1094,7 +1088,7 @@ class Database(Generic[N, V]):
                     return None
                 return target_to_query, self._variable_mapping(stored, query_data, ordered_query_nodes)
 
-            setups: list[tuple[int, _StoredGraph[N, V], tuple[N, ...], dict[N, N], set[N], dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]], tuple[int, int, int, str]]] = []
+            setups: list[tuple[int, _StoredGraph[N, L, V], tuple[N, ...], dict[N, N], set[N], dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]], tuple[int, int, int, str]]] = []
             for component_id in condensation.nodes:
                 if component_id in assigned_components:
                     continue
@@ -1140,8 +1134,8 @@ class Database(Generic[N, V]):
 
     def _enumerate_single_graph_best_first(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         results: list[tuple[NodeMapping[N], VariableMapping[V]]],
         match_limit: int,
         use_lookahead: bool,
@@ -1190,7 +1184,6 @@ class Database(Generic[N, V]):
             if best_target is None or not ordered_candidates:
                 continue
 
-            target_class, target_identifier = stored.labels[best_target]
             for penalty_delta, query_node in enumerate(ordered_candidates):
                 new_target_to_query = dict(state.target_to_query)
                 new_target_to_query[best_target] = query_node
@@ -1201,9 +1194,9 @@ class Database(Generic[N, V]):
                     state.used_query_identifiers,
                 )
 
-                if target_class is not None:
-                    query_identifier = query_data.labels[query_node][1]
-                    variable_mapping = new_target_var_to_query_identifier.setdefault(target_class, {})
+                for variable_class, target_identifier in enumerate(stored.variables[best_target]):
+                    query_identifier = query_data.variables[query_node][variable_class]
+                    variable_mapping = new_target_var_to_query_identifier.setdefault(variable_class, {})
                     if target_identifier not in variable_mapping:
                         variable_mapping[target_identifier] = query_identifier
 
@@ -1226,7 +1219,7 @@ class Database(Generic[N, V]):
     def _search(
         self,
         node: _TrieNode,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         eligible: set[int],
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
@@ -1320,7 +1313,7 @@ class Database(Generic[N, V]):
         self,
         graph_index: int,
         position: int,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         eligible: set[int],
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
@@ -1361,34 +1354,34 @@ class Database(Generic[N, V]):
 
     def _variable_state(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_to_query: dict[N, N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]]]:
         target_var_to_query_identifier: defaultdict[VariableClass, dict[V, V]] = defaultdict(dict)
         used_query_identifiers: defaultdict[VariableClass, set[V]] = defaultdict(set)
 
         for target_node, query_node in target_to_query.items():
-            target_class, target_identifier = stored.labels[target_node]
-            if target_class is None:
-                continue
-
-            query_class, query_identifier = query_data.labels[query_node]
-            if query_class != target_class:
-                raise ValueError("Matched variable classes disagree")
-
-            existing = target_var_to_query_identifier[target_class].get(target_identifier)
-            if existing is not None and existing != query_identifier:
-                raise ValueError("Matched target variable maps to multiple query identifiers")
-            target_var_to_query_identifier[target_class][target_identifier] = query_identifier
+            if stored.labels[target_node] != query_data.labels[query_node]:
+                raise ValueError("Matched node labels disagree")
+            target_variables = stored.variables[target_node]
+            query_variables = query_data.variables[query_node]
+            if len(target_variables) != len(query_variables):
+                raise ValueError("Matched node variable counts disagree")
+            for variable_class, target_identifier in enumerate(target_variables):
+                query_identifier = query_variables[variable_class]
+                existing = target_var_to_query_identifier[variable_class].get(target_identifier)
+                if existing is not None and existing != query_identifier:
+                    raise ValueError("Matched target variable maps to multiple query identifiers")
+                target_var_to_query_identifier[variable_class][target_identifier] = query_identifier
 
         return dict(target_var_to_query_identifier), {}
 
     def _partial_conditions_hold(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_to_query: dict[N, N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> bool:
         for left_position, right_position in stored.full_conditions:
             left_target = stored.order[left_position]
@@ -1401,8 +1394,8 @@ class Database(Generic[N, V]):
 
     def _initial_single_graph_domains(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
@@ -1471,12 +1464,12 @@ class Database(Generic[N, V]):
 
     def _target_candidate_supported(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_node: N,
         query_node: N,
         domains: dict[N, frozenset[N]],
         target_to_query: dict[N, N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> bool:
         if target_node in stored.successors[target_node] and not query_data.graph.has_edge(query_node, query_node):
             return False
@@ -1505,8 +1498,8 @@ class Database(Generic[N, V]):
 
     def _refine_single_graph_domains(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         domains: dict[N, frozenset[N]],
     ) -> dict[N, frozenset[N]] | None:
@@ -1539,11 +1532,11 @@ class Database(Generic[N, V]):
 
     def _candidate_order_key(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_node: N,
         query_node: N,
         domains: dict[N, frozenset[N]],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[int, int, str]:
         impact = 0
         for successor in stored.successors[target_node]:
@@ -1560,8 +1553,8 @@ class Database(Generic[N, V]):
 
     def _propagate_assignment_domains(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         domains: dict[N, frozenset[N]],
         assigned_target: N,
@@ -1587,10 +1580,11 @@ class Database(Generic[N, V]):
             used_query_identifiers,
         )
 
-        target_class, target_identifier = stored.labels[assigned_target]
-        if target_class is not None:
-            query_identifier = query_data.labels[assigned_query][1]
-            variable_mapping = next_target_var_to_query_identifier.setdefault(target_class, {})
+        target_variables = stored.variables[assigned_target]
+        query_variables = query_data.variables[assigned_query]
+        for variable_class, target_identifier in enumerate(target_variables):
+            query_identifier = query_variables[variable_class]
+            variable_mapping = next_target_var_to_query_identifier.setdefault(variable_class, {})
             existing_query_identifier = variable_mapping.get(target_identifier)
             if existing_query_identifier is not None:
                 if existing_query_identifier != query_identifier:
@@ -1598,16 +1592,12 @@ class Database(Generic[N, V]):
             else:
                 variable_mapping[target_identifier] = query_identifier
 
-            same_identifier_domain = query_data.variable_identifier_nodes.get((target_class, query_identifier), frozenset())
-            for variable_target in stored.variable_class_nodes.get(target_class, ()):
+            same_identifier_domain = query_data.variable_identifier_nodes.get((variable_class, query_identifier), frozenset())
+            for variable_target in stored.variable_key_nodes.get((variable_class, target_identifier), ()):
                 if variable_target == assigned_target:
                     continue
                 current_domain = next_domains[variable_target]
-                variable_target_identifier = stored.labels[variable_target][1]
-                if variable_target_identifier == target_identifier:
-                    reduced = current_domain & same_identifier_domain
-                else:
-                    reduced = current_domain
+                reduced = current_domain & same_identifier_domain
                 if not reduced:
                     return None
                 next_domains[variable_target] = reduced
@@ -1642,26 +1632,29 @@ class Database(Generic[N, V]):
 
     def _bitmask_label_candidates(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_node: N,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> int:
-        target_class, target_identifier = stored.labels[target_node]
-        if target_class is None:
-            return query_data.constant_masks.get(target_identifier, 0)
-
-        existing = target_var_to_query_identifier.get(target_class, {}).get(target_identifier)
-        if existing is not None:
-            return query_data.variable_identifier_masks.get((target_class, existing), 0)
-
-        return query_data.variable_masks.get(target_class, 0)
+        del used_query_identifiers
+        mask = query_data.constant_masks.get(stored.labels[target_node], 0)
+        if not mask:
+            return 0
+        for variable_class, target_identifier in enumerate(stored.variables[target_node]):
+            existing = target_var_to_query_identifier.get(variable_class, {}).get(target_identifier)
+            if existing is None:
+                continue
+            mask &= query_data.variable_identifier_masks.get((variable_class, existing), 0)
+            if not mask:
+                return 0
+        return mask
 
     def _initial_single_graph_masks(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
@@ -1723,6 +1716,8 @@ class Database(Generic[N, V]):
             for query_index in _iter_mask_indices(mask):
                 _spend(budget)
                 query_node = query_data.index_to_node[query_index]
+                if len(query_data.variables[query_node]) != len(stored.variables[target_node]):
+                    continue
                 if query_data.in_degrees[query_node] < target_in_degree or query_data.out_degrees[query_node] < target_out_degree:
                     continue
                 if requires_self_loop and not query_data.graph.has_edge(query_node, query_node):
@@ -1737,12 +1732,12 @@ class Database(Generic[N, V]):
 
     def _mask_candidate_supported(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_node: N,
         query_index: int,
         masks: dict[N, int],
         target_to_query: dict[N, N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> bool:
         query_node = query_data.index_to_node[query_index]
         if target_node in stored.successors[target_node] and not query_data.graph.has_edge(query_node, query_node):
@@ -1770,8 +1765,8 @@ class Database(Generic[N, V]):
 
     def _refine_single_graph_masks(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         masks: dict[N, int],
         budget: _OperationBudget | None = None,
@@ -1806,11 +1801,11 @@ class Database(Generic[N, V]):
 
     def _mask_candidate_order_key(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_node: N,
         query_index: int,
         masks: dict[N, int],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[int, int, str]:
         impact = 0
         successor_mask = query_data.successor_masks[query_index]
@@ -1830,8 +1825,8 @@ class Database(Generic[N, V]):
 
     def _propagate_assignment_masks(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         masks: dict[N, int],
         assigned_target: N,
@@ -1851,10 +1846,12 @@ class Database(Generic[N, V]):
             used_query_identifiers,
         )
 
-        target_class, target_identifier = stored.labels[assigned_target]
-        if target_class is not None:
-            query_identifier = query_data.labels[query_data.index_to_node[assigned_query_index]][1]
-            variable_mapping = next_target_var_to_query_identifier.setdefault(target_class, {})
+        assigned_query = query_data.index_to_node[assigned_query_index]
+        target_variables = stored.variables[assigned_target]
+        query_variables = query_data.variables[assigned_query]
+        for variable_class, target_identifier in enumerate(target_variables):
+            query_identifier = query_variables[variable_class]
+            variable_mapping = next_target_var_to_query_identifier.setdefault(variable_class, {})
             existing_query_identifier = variable_mapping.get(target_identifier)
             if existing_query_identifier is not None:
                 if existing_query_identifier != query_identifier:
@@ -1862,16 +1859,12 @@ class Database(Generic[N, V]):
             else:
                 variable_mapping[target_identifier] = query_identifier
 
-            same_identifier_mask = query_data.variable_identifier_masks.get((target_class, query_identifier), 0)
-            for variable_target in stored.variable_class_nodes.get(target_class, ()):
+            same_identifier_mask = query_data.variable_identifier_masks.get((variable_class, query_identifier), 0)
+            for variable_target in stored.variable_key_nodes.get((variable_class, target_identifier), ()):
                 if variable_target == assigned_target:
                     continue
                 current_mask = next_masks[variable_target]
-                variable_target_identifier = stored.labels[variable_target][1]
-                if variable_target_identifier == target_identifier:
-                    reduced_mask = current_mask & same_identifier_mask
-                else:
-                    reduced_mask = current_mask
+                reduced_mask = current_mask & same_identifier_mask
                 if not reduced_mask:
                     return None
                 next_masks[variable_target] = reduced_mask
@@ -1907,8 +1900,8 @@ class Database(Generic[N, V]):
 
     def _find_single_graph_match(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
@@ -1954,8 +1947,8 @@ class Database(Generic[N, V]):
 
     def _enumerate_single_graph_matches(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
@@ -2005,8 +1998,8 @@ class Database(Generic[N, V]):
 
     def _solver_candidates_from_masks(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         masks: dict[N, int],
     ) -> tuple[list[N], list[N], dict[N, int], list[list[int]]] | None:
         order = list(stored.order)
@@ -2022,8 +2015,8 @@ class Database(Generic[N, V]):
 
     def _refined_solver_candidates(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         budget: _OperationBudget | None = None,
     ) -> tuple[list[N], list[N], dict[N, int], list[list[int]]] | None:
         masks = self._initial_single_graph_masks(
@@ -2052,7 +2045,7 @@ class Database(Generic[N, V]):
 
     def _fallback_anchor_targets(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         masks: dict[N, int],
     ) -> tuple[N, ...]:
         product = 1
@@ -2079,8 +2072,8 @@ class Database(Generic[N, V]):
 
     def _find_single_graph_match_anchored(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         try:
             budget = _OperationBudget(self._anchored_ops)
@@ -2126,8 +2119,8 @@ class Database(Generic[N, V]):
 
     def _search_anchored_fallback(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         masks: dict[N, int],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
@@ -2219,8 +2212,8 @@ class Database(Generic[N, V]):
 
     def _find_single_graph_match_z3(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         if not self._z3_enabled or z3 is None:
             return None
@@ -2236,8 +2229,8 @@ class Database(Generic[N, V]):
 
     def _find_single_graph_match_z3_from_masks(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         masks: dict[N, int],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         if not self._z3_enabled or z3 is None:
@@ -2249,8 +2242,8 @@ class Database(Generic[N, V]):
 
     def _find_single_graph_match_z3_from_candidates(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         solver_candidates: tuple[list[N], list[N], dict[N, int], list[list[int]]],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         z3m: Any = z3
@@ -2297,19 +2290,16 @@ class Database(Generic[N, V]):
 
         variables_by_class: dict[VariableClass, dict[V, list[int]]] = {}
         for target_index, target_node in enumerate(order):
-            variable_class, identifier = stored.labels[target_node]
-            if variable_class is None:
-                continue
-            variables_by_class.setdefault(variable_class, {}).setdefault(identifier, []).append(target_index)
+            for variable_class, identifier in enumerate(stored.variables[target_node]):
+                variables_by_class.setdefault(variable_class, {}).setdefault(identifier, []).append(target_index)
 
         for variable_class, target_groups in variables_by_class.items():
             query_identifiers = sorted(
                 {
-                    query_data.labels[query_nodes[query_index]][1]
+                    query_data.variables[query_nodes[query_index]][variable_class]
                     for target_indices in target_groups.values()
                     for target_index in target_indices
                     for query_index in candidates[target_index]
-                    if query_data.labels[query_nodes[query_index]][0] == variable_class
                 },
                 key=repr,
             )
@@ -2330,13 +2320,13 @@ class Database(Generic[N, V]):
                         1,
                     )
                 )
-            for identifier, target_indices in target_groups.items():
-                for target_index in target_indices:
-                    for query_index in candidates[target_index]:
-                        query_identifier = query_data.labels[query_nodes[query_index]][1]
-                        solver.add(
-                            z3m.Implies(
-                                assignment_variables[(target_index, query_index)],
+                for identifier, target_indices in target_groups.items():
+                    for target_index in target_indices:
+                        for query_index in candidates[target_index]:
+                            query_identifier = query_data.variables[query_nodes[query_index]][variable_class]
+                            solver.add(
+                                z3m.Implies(
+                                    assignment_variables[(target_index, query_index)],
                                 identifier_variables[(identifier, query_identifier)],
                             )
                         )
@@ -2359,8 +2349,8 @@ class Database(Generic[N, V]):
 
     def _find_single_graph_match_ortools(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         if not self._ortools_enabled or cp_model is None:
             return None
@@ -2376,8 +2366,8 @@ class Database(Generic[N, V]):
 
     def _find_single_graph_match_ortools_from_masks(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         masks: dict[N, int],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         if not self._ortools_enabled or cp_model is None:
@@ -2389,8 +2379,8 @@ class Database(Generic[N, V]):
 
     def _find_single_graph_match_ortools_from_candidates(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         solver_candidates: tuple[list[N], list[N], dict[N, int], list[list[int]]],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         cp: Any = cp_model
@@ -2430,19 +2420,16 @@ class Database(Generic[N, V]):
 
         variables_by_class: dict[VariableClass, dict[V, list[int]]] = {}
         for target_index, target_node in enumerate(order):
-            variable_class, identifier = stored.labels[target_node]
-            if variable_class is None:
-                continue
-            variables_by_class.setdefault(variable_class, {}).setdefault(identifier, []).append(target_index)
+            for variable_class, identifier in enumerate(stored.variables[target_node]):
+                variables_by_class.setdefault(variable_class, {}).setdefault(identifier, []).append(target_index)
 
         for variable_class, target_groups in variables_by_class.items():
             query_identifiers = sorted(
                 {
-                    query_data.labels[query_nodes[query_index]][1]
+                    query_data.variables[query_nodes[query_index]][variable_class]
                     for target_indices in target_groups.values()
                     for target_index in target_indices
                     for query_index in candidates[target_index]
-                    if query_data.labels[query_nodes[query_index]][0] == variable_class
                 },
                 key=repr,
             )
@@ -2455,13 +2442,13 @@ class Database(Generic[N, V]):
             }
             for identifier in target_groups:
                 model.AddExactlyOne(identifier_variables[(identifier, query_identifier)] for query_identifier in query_identifiers)
-            for identifier, target_indices in target_groups.items():
-                for target_index in target_indices:
-                    for query_index in candidates[target_index]:
-                        query_identifier = query_data.labels[query_nodes[query_index]][1]
-                        model.AddImplication(
-                            assignment_variables[(target_index, query_index)],
-                            identifier_variables[(identifier, query_identifier)],
+                for identifier, target_indices in target_groups.items():
+                    for target_index in target_indices:
+                        for query_index in candidates[target_index]:
+                            query_identifier = query_data.variables[query_nodes[query_index]][variable_class]
+                            model.AddImplication(
+                                assignment_variables[(target_index, query_index)],
+                                identifier_variables[(identifier, query_identifier)],
                         )
 
         solver: Any = cp.CpSolver()
@@ -2485,8 +2472,8 @@ class Database(Generic[N, V]):
 
     def _search_single_graph_masks(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         masks: dict[N, int],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
@@ -2566,8 +2553,8 @@ class Database(Generic[N, V]):
 
     def _search_single_graph_masks_collect(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         target_to_query: dict[N, N],
         masks: dict[N, int],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
@@ -2644,52 +2631,51 @@ class Database(Generic[N, V]):
 
     def _dynamic_label_candidates(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_node: N,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> frozenset[N]:
-        target_class, target_identifier = stored.labels[target_node]
-        if target_class is None:
-            return query_data.constant_nodes.get(target_identifier, frozenset())
-
-        existing = target_var_to_query_identifier.get(target_class, {}).get(target_identifier)
-        if existing is not None:
-            return query_data.variable_identifier_nodes.get((target_class, existing), frozenset())
-
-        return query_data.variable_nodes.get(target_class, frozenset())
+        del used_query_identifiers
+        candidates = query_data.constant_nodes.get(stored.labels[target_node], frozenset())
+        for variable_class, target_identifier in enumerate(stored.variables[target_node]):
+            existing = target_var_to_query_identifier.get(variable_class, {}).get(target_identifier)
+            if existing is None:
+                continue
+            candidates = candidates & query_data.variable_identifier_nodes.get((variable_class, existing), frozenset())
+            if not candidates:
+                return frozenset()
+        return candidates
 
     def _dynamic_label_compatible(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_node: N,
         query_node: N,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> bool:
-        target_class, target_identifier = stored.labels[target_node]
-        query_class, query_identifier = query_data.labels[query_node]
-
-        if target_class is None:
-            return query_class is None and query_identifier == target_identifier
-
-        if query_class != target_class:
+        del used_query_identifiers
+        if stored.labels[target_node] != query_data.labels[query_node]:
             return False
-
-        existing = target_var_to_query_identifier.get(target_class, {}).get(target_identifier)
-        if existing is not None:
-            return query_identifier == existing
-
+        target_variables = stored.variables[target_node]
+        query_variables = query_data.variables[query_node]
+        if len(target_variables) != len(query_variables):
+            return False
+        for variable_class, target_identifier in enumerate(target_variables):
+            existing = target_var_to_query_identifier.get(variable_class, {}).get(target_identifier)
+            if existing is not None and query_variables[variable_class] != existing:
+                return False
         return True
 
     def _dynamic_candidates_for_target(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_node: N,
         target_to_query: dict[N, N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
@@ -2740,9 +2726,9 @@ class Database(Generic[N, V]):
 
     def _dynamic_choice(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_to_query: dict[N, N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
@@ -2792,19 +2778,17 @@ class Database(Generic[N, V]):
         ordered_candidates = best_candidates
         if use_lookahead and 1 < len(best_candidates) <= 16:
             candidate_scores: list[tuple[tuple[float, float, str], N]] = []
-            target_class, target_identifier = stored.labels[best_target]
             for query_node in best_candidates:
                 target_to_query[best_target] = query_node
                 used_query_nodes.add(query_node)
 
-                added_variable_mapping = False
-                query_identifier: V | None = None
-                if target_class is not None:
-                    query_identifier = query_data.labels[query_node][1]
-                    variable_mapping = target_var_to_query_identifier.setdefault(target_class, {})
+                added_mappings: list[tuple[VariableClass, V]] = []
+                for variable_class, target_identifier in enumerate(stored.variables[best_target]):
+                    query_identifier = query_data.variables[query_node][variable_class]
+                    variable_mapping = target_var_to_query_identifier.setdefault(variable_class, {})
                     if target_identifier not in variable_mapping:
                         variable_mapping[target_identifier] = query_identifier
-                        added_variable_mapping = True
+                        added_mappings.append((variable_class, target_identifier))
 
                 next_key = self._dynamic_next_choice_key(
                     stored,
@@ -2816,10 +2800,10 @@ class Database(Generic[N, V]):
                 )
                 candidate_scores.append((next_key, query_node))
 
-                if target_class is not None and added_variable_mapping and query_identifier is not None:
-                    del target_var_to_query_identifier[target_class][target_identifier]
-                    if not target_var_to_query_identifier[target_class]:
-                        del target_var_to_query_identifier[target_class]
+                for variable_class, target_identifier in reversed(added_mappings):
+                    del target_var_to_query_identifier[variable_class][target_identifier]
+                    if not target_var_to_query_identifier[variable_class]:
+                        del target_var_to_query_identifier[variable_class]
 
                 used_query_nodes.remove(query_node)
                 del target_to_query[best_target]
@@ -2831,9 +2815,9 @@ class Database(Generic[N, V]):
 
     def _complete_single_graph_dynamic(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_to_query: dict[N, N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
@@ -2853,19 +2837,17 @@ class Database(Generic[N, V]):
         if best_target is None or not ordered_candidates:
             return False
 
-        target_class, target_identifier = stored.labels[best_target]
         for query_node in ordered_candidates:
             target_to_query[best_target] = query_node
             used_query_nodes.add(query_node)
 
-            added_variable_mapping = False
-            query_identifier: V | None = None
-            if target_class is not None:
-                query_identifier = query_data.labels[query_node][1]
-                variable_mapping = target_var_to_query_identifier.setdefault(target_class, {})
+            added_mappings: list[tuple[VariableClass, V]] = []
+            for variable_class, target_identifier in enumerate(stored.variables[best_target]):
+                query_identifier = query_data.variables[query_node][variable_class]
+                variable_mapping = target_var_to_query_identifier.setdefault(variable_class, {})
                 if target_identifier not in variable_mapping:
                     variable_mapping[target_identifier] = query_identifier
-                    added_variable_mapping = True
+                    added_mappings.append((variable_class, target_identifier))
 
             if self._complete_single_graph_dynamic(
                 stored,
@@ -2877,10 +2859,10 @@ class Database(Generic[N, V]):
             ):
                 return True
 
-            if target_class is not None and added_variable_mapping and query_identifier is not None:
-                del target_var_to_query_identifier[target_class][target_identifier]
-                if not target_var_to_query_identifier[target_class]:
-                    del target_var_to_query_identifier[target_class]
+            for variable_class, target_identifier in reversed(added_mappings):
+                del target_var_to_query_identifier[variable_class][target_identifier]
+                if not target_var_to_query_identifier[variable_class]:
+                    del target_var_to_query_identifier[variable_class]
 
             used_query_nodes.remove(query_node)
             del target_to_query[best_target]
@@ -2889,9 +2871,9 @@ class Database(Generic[N, V]):
 
     def _enumerate_single_graph_dynamic(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_to_query: dict[N, N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
@@ -2920,19 +2902,17 @@ class Database(Generic[N, V]):
         if best_target is None or not ordered_candidates:
             return False
 
-        target_class, target_identifier = stored.labels[best_target]
         for query_node in ordered_candidates:
             target_to_query[best_target] = query_node
             used_query_nodes.add(query_node)
 
-            added_variable_mapping = False
-            query_identifier: V | None = None
-            if target_class is not None:
-                query_identifier = query_data.labels[query_node][1]
-                variable_mapping = target_var_to_query_identifier.setdefault(target_class, {})
+            added_mappings: list[tuple[VariableClass, V]] = []
+            for variable_class, target_identifier in enumerate(stored.variables[best_target]):
+                query_identifier = query_data.variables[query_node][variable_class]
+                variable_mapping = target_var_to_query_identifier.setdefault(variable_class, {})
                 if target_identifier not in variable_mapping:
                     variable_mapping[target_identifier] = query_identifier
-                    added_variable_mapping = True
+                    added_mappings.append((variable_class, target_identifier))
 
             stop = self._enumerate_single_graph_dynamic(
                 stored,
@@ -2946,10 +2926,10 @@ class Database(Generic[N, V]):
                 use_lookahead,
             )
 
-            if target_class is not None and added_variable_mapping and query_identifier is not None:
-                del target_var_to_query_identifier[target_class][target_identifier]
-                if not target_var_to_query_identifier[target_class]:
-                    del target_var_to_query_identifier[target_class]
+            for variable_class, target_identifier in reversed(added_mappings):
+                del target_var_to_query_identifier[variable_class][target_identifier]
+                if not target_var_to_query_identifier[variable_class]:
+                    del target_var_to_query_identifier[variable_class]
 
             used_query_nodes.remove(query_node)
             del target_to_query[best_target]
@@ -2961,9 +2941,9 @@ class Database(Generic[N, V]):
 
     def _dynamic_next_choice_key(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         target_to_query: dict[N, N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
@@ -3009,9 +2989,9 @@ class Database(Generic[N, V]):
     def _single_graph_candidates(
         self,
         graph_index: int,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         position: int,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
     ) -> list[tuple[N, frozenset[int]]]:
@@ -3069,7 +3049,7 @@ class Database(Generic[N, V]):
     def _candidate_nodes(
         self,
         node: _TrieNode,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         active_graphs: set[int],
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
@@ -3148,7 +3128,7 @@ class Database(Generic[N, V]):
         topology_pattern: _TopologyPattern,
         anchor_position: int,
         matched_query_nodes: list[N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> frozenset[N]:
         anchored: frozenset[N] | None = None
 
@@ -3165,7 +3145,7 @@ class Database(Generic[N, V]):
         topology_pattern: _TopologyPattern,
         anchor_position: int,
         matched_query_nodes: list[N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> int:
         size: int | None = None
 
@@ -3179,111 +3159,84 @@ class Database(Generic[N, V]):
 
     def _label_candidate_nodes(
         self,
-        label_pattern: _LabelPattern[V],
+        label_pattern: _LabelPattern[L],
         matched_query_nodes: list[N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> frozenset[N]:
-        if label_pattern.kind == "const":
-            if label_pattern.constant_identifier is None:
-                return frozenset()
-            return query_data.constant_nodes.get(label_pattern.constant_identifier, frozenset())
-
-        if label_pattern.variable_class is None:
-            return frozenset()
-
-        if label_pattern.kind == "var-repeat":
-            if label_pattern.repeated_from is None:
-                return frozenset()
-            repeated_query_node = matched_query_nodes[label_pattern.repeated_from]
-            _, repeated_identifier = query_data.labels[repeated_query_node]
-            return query_data.variable_identifier_nodes.get(
-                (label_pattern.variable_class, repeated_identifier),
+        candidates = query_data.constant_nodes.get(label_pattern.node_label, frozenset())
+        for variable_class, repeated_from in enumerate(label_pattern.repeated_from):
+            if repeated_from is None or repeated_from >= len(matched_query_nodes):
+                continue
+            repeated_query_node = matched_query_nodes[repeated_from]
+            repeated_identifier = query_data.variables[repeated_query_node][variable_class]
+            candidates = candidates & query_data.variable_identifier_nodes.get(
+                (variable_class, repeated_identifier),
                 frozenset(),
             )
-
-        return query_data.variable_nodes.get(label_pattern.variable_class, frozenset())
+            if not candidates:
+                return frozenset()
+        return candidates
 
     def _label_pattern_compatible(
         self,
-        label_pattern: _LabelPattern[V],
+        label_pattern: _LabelPattern[L],
         matched_query_nodes: list[N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         candidate: N,
     ) -> bool:
-        query_class, query_identifier = query_data.labels[candidate]
-
-        if label_pattern.kind == "const":
-            return query_class is None and query_identifier == label_pattern.constant_identifier
-
-        if query_class != label_pattern.variable_class:
+        if query_data.labels[candidate] != label_pattern.node_label:
             return False
-
-        if label_pattern.kind == "var-repeat":
-            if label_pattern.repeated_from is None:
+        candidate_variables = query_data.variables[candidate]
+        if len(candidate_variables) != len(label_pattern.repeated_from):
+            return False
+        for variable_class, repeated_from in enumerate(label_pattern.repeated_from):
+            if repeated_from is None:
+                continue
+            if repeated_from >= len(matched_query_nodes):
+                continue
+            repeated_identifier = query_data.variables[matched_query_nodes[repeated_from]][variable_class]
+            if candidate_variables[variable_class] != repeated_identifier:
                 return False
-            _, repeated_identifier = query_data.labels[matched_query_nodes[label_pattern.repeated_from]]
-            return query_identifier == repeated_identifier
-
-        return all(
-            query_identifier != query_data.labels[matched_query_nodes[previous_position]][1]
-            for previous_position in label_pattern.same_class_previous
-        )
+        return True
 
     def _future_requirement_key(
         self,
-        label_pattern: _LabelPattern[V],
+        label_pattern: _LabelPattern[L],
         prefix_query_nodes: list[N],
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> tuple[Any, ...]:
-        if label_pattern.kind == "const":
-            return ("const", label_pattern.constant_identifier)
-
-        if label_pattern.variable_class is None:
-            return ("invalid",)
-
-        if label_pattern.kind == "var-repeat":
-            if label_pattern.repeated_from is not None and label_pattern.repeated_from < len(prefix_query_nodes):
-                _, identifier = query_data.labels[prefix_query_nodes[label_pattern.repeated_from]]
-                return ("var-id", label_pattern.variable_class, identifier)
-            return ("var-class", label_pattern.variable_class)
-
-        forbidden_identifiers = tuple(
-            sorted(
-                (
-                    query_data.labels[prefix_query_nodes[previous_position]][1]
-                    for previous_position in label_pattern.same_class_previous
-                    if previous_position < len(prefix_query_nodes)
-                ),
-                key=repr,
+        required_identifiers = tuple(
+            (
+                variable_class,
+                query_data.variables[prefix_query_nodes[repeated_from]][variable_class],
             )
+            for variable_class, repeated_from in enumerate(label_pattern.repeated_from)
+            if repeated_from is not None and repeated_from < len(prefix_query_nodes)
         )
-        return ("var-new", label_pattern.variable_class, forbidden_identifiers)
+        return ("label", label_pattern.node_label, len(label_pattern.repeated_from), required_identifiers)
 
     def _neighbor_matches_requirement(
         self,
         requirement: tuple[Any, ...],
         query_node: N,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
     ) -> bool:
-        query_class, query_identifier = query_data.labels[query_node]
-        kind = requirement[0]
-
-        if kind == "const":
-            return query_class is None and query_identifier == requirement[1]
-        if kind == "var-id":
-            return query_class == requirement[1] and query_identifier == requirement[2]
-        if kind == "var-class":
-            return query_class == requirement[1]
-        if kind == "var-new":
-            return query_class == requirement[1] and query_identifier not in requirement[2]
-        return False
+        kind, required_label, variable_count, required_identifiers = requirement
+        if kind != "label":
+            return False
+        if query_data.labels[query_node] != required_label:
+            return False
+        query_variables = query_data.variables[query_node]
+        if len(query_variables) != variable_count:
+            return False
+        return all(query_variables[variable_class] == identifier for variable_class, identifier in required_identifiers)
 
     def _future_neighbor_feasible(
         self,
-        stored: _StoredGraph[N, V],
+        stored: _StoredGraph[N, L, V],
         position: int,
         candidate: N,
-        query_data: _QueryData[N, V],
+        query_data: _QueryData[N, L, V],
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
     ) -> bool:
@@ -3341,7 +3294,7 @@ class Database(Generic[N, V]):
             -len(node.descendant_graph_indices),
         )
 
-    def _can_match(self, stored: _StoredGraph[N, V], query_data: _QueryData[N, V]) -> bool:
+    def _can_match(self, stored: _StoredGraph[N, L, V], query_data: _QueryData[N, L, V]) -> bool:
         if stored.graph.number_of_nodes() > query_data.graph.number_of_nodes():
             return False
         if stored.graph.number_of_edges() > query_data.graph.number_of_edges():
@@ -3359,14 +3312,12 @@ class Database(Generic[N, V]):
         for target_node, target_label in stored.labels.items():
             target_in_degree = stored.in_degrees[target_node]
             target_out_degree = stored.out_degrees[target_node]
-            if target_label[0] is None:
-                candidates = query_data.constant_nodes.get(target_label[1], frozenset())
-            else:
-                candidates = query_data.variable_nodes.get(target_label[0], frozenset())
+            candidates = query_data.constant_nodes.get(target_label, frozenset())
 
             if not any(
                 query_data.in_degrees[query_node] >= target_in_degree
                 and query_data.out_degrees[query_node] >= target_out_degree
+                and len(stored.variables[target_node]) == len(query_data.variables[query_node])
                 for query_node in candidates
             ):
                 return False
@@ -3375,24 +3326,24 @@ class Database(Generic[N, V]):
 
     def _variable_mapping(
         self,
-        stored: _StoredGraph[N, V],
-        query_data: _QueryData[N, V],
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
         matched_query_nodes: list[N],
     ) -> VariableMapping[V]:
         variable_mapping: defaultdict[VariableClass, dict[V, V]] = defaultdict(dict)
 
         for target_node, query_node in zip(stored.order, matched_query_nodes, strict=True):
-            target_class, target_identifier = stored.labels[target_node]
-            if target_class is None:
-                continue
-
-            query_class, query_identifier = query_data.labels[query_node]
-            if query_class != target_class:
-                raise ValueError("Matched variable classes disagree")
-
-            existing = variable_mapping[target_class].get(target_identifier)
-            if existing is not None and existing != query_identifier:
-                raise ValueError("Matched target variable maps to multiple query identifiers")
-            variable_mapping[target_class][target_identifier] = query_identifier
+            if stored.labels[target_node] != query_data.labels[query_node]:
+                raise ValueError("Matched node labels disagree")
+            target_variables = stored.variables[target_node]
+            query_variables = query_data.variables[query_node]
+            if len(target_variables) != len(query_variables):
+                raise ValueError("Matched node variable counts disagree")
+            for variable_class, target_identifier in enumerate(target_variables):
+                query_identifier = query_variables[variable_class]
+                existing = variable_mapping[variable_class].get(target_identifier)
+                if existing is not None and existing != query_identifier:
+                    raise ValueError("Matched target variable maps to multiple query identifiers")
+                variable_mapping[variable_class][target_identifier] = query_identifier
 
         return dict(variable_mapping)

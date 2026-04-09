@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from collections.abc import Hashable, Mapping
+from collections.abc import Mapping
 from collections import defaultdict
 from random import Random
 
@@ -10,14 +10,16 @@ import networkx as nx
 
 from glabvartrie import Database
 
-def random_connected_graph(r: Random, nodes: range, labels: range, variable_kinds: range, variables: range, variable_density: float, edge_density: float) -> nx.DiGraph[int]:
+def random_connected_graph(r: Random, nodes: range, labels: range, variables: range, variable_density: float, edge_density: float) -> nx.DiGraph[int]:
     g = nx.DiGraph()
     for n in nodes:
+        base_label = r.choice(labels)
         if r.random() < variable_density:
-            label = (r.choice(variable_kinds), r.choice(variables))
+            arity = r.randrange(1, 4)
+            node_vars = tuple(r.choice(variables) for _ in range(arity))
         else:
-            label = (None, r.choice(labels))
-        g.add_node(n, label=label)
+            node_vars = ()
+        g.add_node(n, label=base_label, vars=node_vars)
     wccs = [[n] for n in nodes]
     while len(wccs) > 1:
         r.shuffle(wccs)
@@ -48,30 +50,31 @@ def is_valid_match(
     target_graph: nx.DiGraph[int],
     query_graph: nx.DiGraph[int],
     node_mapping: dict[int, int],
-    variable_mapping: Mapping[Hashable, Mapping[int, int]],
+    variable_mapping: Mapping[int, Mapping[int, int]],
 ) -> bool:
     if set(node_mapping) != set(target_graph.nodes):
         return False
     if len(set(node_mapping.values())) != len(node_mapping):
         return False
 
-    computed_variable_mapping: defaultdict[Hashable, dict[int, int]] = defaultdict(dict)
+    computed_variable_mapping: defaultdict[int, dict[int, int]] = defaultdict(dict)
     for target_node, query_node in node_mapping.items():
         if query_node not in query_graph:
             return False
 
-        target_class, target_identifier = target_graph.nodes[target_node]["label"]
-        query_class, query_identifier = query_graph.nodes[query_node]["label"]
-        if target_class is None:
-            if query_class is not None or query_identifier != target_identifier:
-                return False
-        else:
-            if query_class != target_class:
-                return False
-            existing = computed_variable_mapping[target_class].get(target_identifier)
+        if target_graph.nodes[target_node]["label"] != query_graph.nodes[query_node]["label"]:
+            return False
+
+        target_vars = target_graph.nodes[target_node]["vars"]
+        query_vars = query_graph.nodes[query_node]["vars"]
+        if len(target_vars) != len(query_vars):
+            return False
+        for slot, target_identifier in enumerate(target_vars):
+            query_identifier = query_vars[slot]
+            existing = computed_variable_mapping[slot].get(target_identifier)
             if existing is not None and existing != query_identifier:
                 return False
-            computed_variable_mapping[target_class][target_identifier] = query_identifier
+            computed_variable_mapping[slot][target_identifier] = query_identifier
 
     for source, target in target_graph.edges:
         if not query_graph.has_edge(node_mapping[source], node_mapping[target]):
@@ -83,7 +86,7 @@ def is_valid_match(
     } == dict(variable_mapping)
 
 def embed_graph(query: nx.DiGraph[int], t: nx.DiGraph[int], available_nodes: list[int], variables: list[int]):
-    var_mapping: defaultdict[str, dict[int, int]] = defaultdict(dict)
+    var_mapping: defaultdict[int, dict[int, int]] = defaultdict(dict)
     node_mapping: dict[int, int] = {}
     for n in t:
         if n in node_mapping:
@@ -99,33 +102,29 @@ def embed_graph(query: nx.DiGraph[int], t: nx.DiGraph[int], available_nodes: lis
                 succ_matching = available_nodes.pop()
                 node_mapping[succ] = succ_matching
             query.add_edge(matching, succ_matching)
-        varkind, idx = t.nodes[n]['label']
-        if varkind is None:
-            query.nodes[matching]['label'] = (None, idx)
-        elif idx in var_mapping[varkind]:
-            query.nodes[matching]['label'] = (varkind, var_mapping[varkind][idx])
-        else:
-            new_var = variables.pop()
-            var_mapping[varkind][idx] = new_var
-            query.nodes[matching]['label'] = (varkind, new_var)
+        query.nodes[matching]['label'] = t.nodes[n]['label']
+        query.nodes[matching]['vars'] = tuple(
+            var_mapping[slot].setdefault(identifier, variables.pop())
+            for slot, identifier in enumerate(t.nodes[n]['vars'])
+        )
 
 class TestRegressions(unittest.TestCase):
     def test_label_aware_symmetry_conditions(self):
-        d: Database[int, int] = Database(node_label=lambda attrs: attrs['label'])
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
 
         target = nx.DiGraph()
-        target.add_node(1, label=(None, 3))
-        target.add_node(3, label=(None, 0))
-        target.add_node(2, label=(32, 0))
-        target.add_node(0, label=(5, 3))
+        target.add_node(1, label=3, vars=())
+        target.add_node(3, label=0, vars=())
+        target.add_node(2, label=32, vars=(0,))
+        target.add_node(0, label=5, vars=(3,))
         target.add_edges_from([(1, 0), (1, 2), (1, 3)])
         d.index(target)
 
         query = nx.DiGraph()
-        query.add_node(100, label=(None, 3))
-        query.add_node(30, label=(None, 0))
-        query.add_node(20, label=(32, 152))
-        query.add_node(10, label=(5, 251))
+        query.add_node(100, label=(3, ()), vars=())
+        query.add_node(30, label=(0, ()), vars=())
+        query.add_node(20, label=(32, ("x",)), vars=(152,))
+        query.add_node(10, label=(5, ("y",)), vars=(251,))
         query.add_edges_from([(100, 10), (100, 20), (100, 30)])
 
         result = list(d.query(query))
@@ -136,19 +135,19 @@ class TestRegressions(unittest.TestCase):
         self.assertTrue(is_valid_match(target, query, found_node_mapping, found_var_mapping))
 
 
+FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
+FUZZ_OFFSET = int(os.environ.get("FUZZ_OFFSET", 0))
+
 class TestFuzz(unittest.TestCase):
     def test_fuzz(self):
-        fuzz_count = int(os.environ.get("FUZZ_COUNT", 100))
-        fuzz_offset = int(os.environ.get("FUZZ_OFFSET", 0))
-
         def rcg(r: Random, n: int | None = None):
             if n is None:
                 n = r.randrange(3, 100)
-            return random_connected_graph(r, range(n), range(r.randrange(1, 10)), range(r.randrange(1, 100)), range(r.randrange(1, 10)), r.random(), r.random() * 0.1)
+            return random_connected_graph(r, range(n), range(r.randrange(1, 10)), range(r.randrange(1, 100)), r.random(), r.random() * 0.1)
 
-        for i in range(fuzz_offset, fuzz_offset + fuzz_count):
+        for i in range(FUZZ_OFFSET, FUZZ_OFFSET + FUZZ_COUNT):
             r = Random(i)
-            d: Database[int, int] = Database(node_label=lambda attrs: attrs['label'])
+            d: Database[int, int, int] = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
 
             for _ in range(r.randrange(100)):
                 d.index(rcg(r))
@@ -176,9 +175,6 @@ class TestFuzz(unittest.TestCase):
             print("OK", i)
 
     def test_fuzz_independent(self):
-        fuzz_count = int(os.environ.get("FUZZ_COUNT", 100))
-        fuzz_offset = int(os.environ.get("FUZZ_OFFSET", 0))
-
         label_start = 0
         def rcg(r: Random, n: int | None = None):
             nonlocal label_start
@@ -186,13 +182,13 @@ class TestFuzz(unittest.TestCase):
                 n = r.randrange(3, 100)
             label_count = r.randrange(1, 10)
             label_end = label_start + label_count
-            result = random_connected_graph(r, range(n), range(label_start, label_end), range(r.randrange(1, 100)), range(r.randrange(1, 10)), r.random(), r.random() * 0.1)
+            result = random_connected_graph(r, range(n), range(label_start, label_end), range(r.randrange(1, 100)), r.random(), r.random() * 0.1)
             label_start = label_end
             return result
 
-        for i in range(fuzz_offset, fuzz_offset + fuzz_count):
+        for i in range(FUZZ_OFFSET, FUZZ_OFFSET + FUZZ_COUNT):
             r = Random(i)
-            d: Database[int, int] = Database(node_label=lambda attrs: attrs['label'])
+            d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
             label_start = 0
 
             for _ in range(r.randrange(100)):
@@ -219,9 +215,6 @@ class TestFuzz(unittest.TestCase):
                     assert False, "There is no corresponding finding for this target"
 
     def test_fuzz_many_small_sparse_query(self):
-        fuzz_count = int(os.environ.get("FUZZ_COUNT", 100))
-        fuzz_offset = int(os.environ.get("FUZZ_OFFSET", 0))
-
         def rcg(r: Random, n: int | None = None):
             if n is None:
                 n = r.randrange(3, 11)
@@ -230,14 +223,13 @@ class TestFuzz(unittest.TestCase):
                 range(n),
                 range(r.randrange(1, 10)),
                 range(r.randrange(1, 100)),
-                range(r.randrange(1, 10)),
                 r.random(),
                 0.02,
             )
 
-        for i in range(fuzz_offset, fuzz_offset + fuzz_count):
+        for i in range(FUZZ_OFFSET, FUZZ_OFFSET + FUZZ_COUNT):
             r = Random(i)
-            d: Database[int, int] = Database(node_label=lambda attrs: attrs['label'])
+            d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
 
             for _ in range(r.randrange(500, 2001)):
                 d.index(rcg(r))
@@ -251,7 +243,6 @@ class TestFuzz(unittest.TestCase):
                 range(r.randrange(max(50, needed_nodes), 101)),
                 range(r.randrange(1, 10)),
                 range(r.randrange(1, 100)),
-                range(r.randrange(1, 10)),
                 r.random(),
                 0.02,
             )
