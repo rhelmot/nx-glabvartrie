@@ -894,6 +894,9 @@ class Database(Generic[N, V]):
             return None
         if self._direct_graph_priority(stored, query_data)[0] > 16:
             return None
+        match = self._find_single_graph_match_anchored(stored, query_data)
+        if match is not None:
+            return match
         match = self._find_single_graph_match_ortools(stored, query_data)
         if match is not None:
             return match
@@ -1723,15 +1726,28 @@ class Database(Generic[N, V]):
             deadline,
         )
 
+    def _solver_candidates_from_masks(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+        masks: dict[N, int],
+    ) -> tuple[list[N], list[N], dict[N, int], list[list[int]]] | None:
+        order = list(stored.order)
+        query_nodes = list(query_data.graph.nodes)
+        target_position = {node: position for position, node in enumerate(order)}
+        candidates = [
+            list(_iter_mask_indices(masks[target_node]))
+            for target_node in order
+        ]
+        if any(not target_candidates for target_candidates in candidates):
+            return None
+        return order, query_nodes, target_position, candidates
+
     def _refined_solver_candidates(
         self,
         stored: _StoredGraph[N, V],
         query_data: _QueryData[N, V],
     ) -> tuple[list[N], list[N], dict[N, int], list[list[int]]] | None:
-        order = list(stored.order)
-        query_nodes = list(query_data.graph.nodes)
-        target_position = {node: position for position, node in enumerate(order)}
-
         masks = self._initial_single_graph_masks(
             stored,
             query_data,
@@ -1753,14 +1769,175 @@ class Database(Generic[N, V]):
         if refined is None:
             return None
 
-        candidates = [
-            list(_iter_mask_indices(refined[target_node]))
-            for target_node in order
-        ]
-        if any(not target_candidates for target_candidates in candidates):
+        return self._solver_candidates_from_masks(stored, query_data, refined)
+
+    def _fallback_anchor_targets(
+        self,
+        stored: _StoredGraph[N, V],
+        masks: dict[N, int],
+    ) -> tuple[N, ...]:
+        product = 1
+        anchors: list[N] = []
+        for target_node in sorted(
+            stored.order,
+            key=lambda current_target: (
+                masks[current_target].bit_count(),
+                -(stored.in_degrees[current_target] + stored.out_degrees[current_target]),
+                repr(current_target),
+            ),
+        ):
+            domain_size = masks[target_node].bit_count()
+            if domain_size <= 1:
+                continue
+            next_product = product * domain_size
+            if anchors and next_product > 512:
+                break
+            anchors.append(target_node)
+            product = next_product
+            if len(anchors) >= 4:
+                break
+        return tuple(anchors)
+
+    def _find_single_graph_match_anchored(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        try:
+            masks = self._initial_single_graph_masks(
+                stored,
+                query_data,
+                {},
+                set(),
+                {},
+                {},
+                None,
+            )
+            if masks is None:
+                return None
+
+            refined = self._refine_single_graph_masks(
+                stored,
+                query_data,
+                {},
+                masks,
+                None,
+            )
+            if refined is None:
+                return None
+
+            anchor_targets = self._fallback_anchor_targets(stored, refined)
+            if not anchor_targets:
+                return None
+
+            return self._search_anchored_fallback(
+                stored,
+                query_data,
+                {},
+                refined,
+                {},
+                {},
+                anchor_targets,
+                0,
+                time.monotonic() + 6.0,
+            )
+        except _SearchTimeout:
             return None
 
-        return order, query_nodes, target_position, candidates
+    def _search_anchored_fallback(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+        target_to_query: dict[N, N],
+        masks: dict[N, int],
+        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        used_query_identifiers: dict[VariableClass, set[V]],
+        anchor_targets: tuple[N, ...],
+        anchor_index: int,
+        deadline: float,
+    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        if time.monotonic() >= deadline:
+            return None
+
+        if anchor_index >= len(anchor_targets):
+            variable_state = self._copy_variable_state(target_var_to_query_identifier, used_query_identifiers)
+            try:
+                return self._search_single_graph_masks(
+                    stored,
+                    query_data,
+                    dict(target_to_query),
+                    dict(masks),
+                    variable_state[0],
+                    variable_state[1],
+                    min(deadline, time.monotonic() + 0.5),
+                )
+            except _SearchTimeout:
+                return None
+
+        target_node = anchor_targets[anchor_index]
+        if target_node in target_to_query:
+            return self._search_anchored_fallback(
+                stored,
+                query_data,
+                target_to_query,
+                masks,
+                target_var_to_query_identifier,
+                used_query_identifiers,
+                anchor_targets,
+                anchor_index + 1,
+                deadline,
+            )
+
+        candidate_indices = list(_iter_mask_indices(masks[target_node]))
+        candidate_indices.sort(
+            key=lambda query_index: self._mask_candidate_order_key(
+                stored,
+                target_node,
+                query_index,
+                masks,
+                query_data,
+            ),
+        )
+
+        for query_index in candidate_indices:
+            if time.monotonic() >= deadline:
+                return None
+            query_node = query_data.index_to_node[query_index]
+            next_target_to_query = dict(target_to_query)
+            next_target_to_query[target_node] = query_node
+            if not self._partial_conditions_hold(stored, next_target_to_query, query_data):
+                continue
+
+            propagated = self._propagate_assignment_masks(
+                stored,
+                query_data,
+                next_target_to_query,
+                masks,
+                target_node,
+                query_index,
+                target_var_to_query_identifier,
+                used_query_identifiers,
+                deadline,
+            )
+            if propagated is None:
+                continue
+
+            next_masks, next_target_var_to_query_identifier, next_used_query_identifiers = propagated
+            match = self._search_anchored_fallback(
+                stored,
+                query_data,
+                next_target_to_query,
+                next_masks,
+                next_target_var_to_query_identifier,
+                next_used_query_identifiers,
+                anchor_targets,
+                anchor_index + 1,
+                deadline,
+            )
+            if match is not None:
+                return match
+
+        return None
 
     def _find_single_graph_match_z3(
         self,
@@ -1773,19 +1950,41 @@ class Database(Generic[N, V]):
         solver_candidates = self._refined_solver_candidates(stored, query_data)
         if solver_candidates is None:
             return None
+        return self._find_single_graph_match_z3_from_candidates(stored, query_data, solver_candidates)
+
+    def _find_single_graph_match_z3_from_masks(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+        masks: dict[N, int],
+    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        if not self._z3_enabled or z3 is None:
+            return None
+        solver_candidates = self._solver_candidates_from_masks(stored, query_data, masks)
+        if solver_candidates is None:
+            return None
+        return self._find_single_graph_match_z3_from_candidates(stored, query_data, solver_candidates)
+
+    def _find_single_graph_match_z3_from_candidates(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+        solver_candidates: tuple[list[N], list[N], dict[N, int], list[list[int]]],
+    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        z3m: Any = z3
         order, query_nodes, target_position, candidates = solver_candidates
 
-        solver = z3.Solver()
+        solver = z3m.Solver()
         solver.set(timeout=10_000)
 
         assignment_variables: dict[tuple[int, int], Any] = {
-            (target_index, query_index): z3.Bool(f"x_{target_index}_{query_index}")
+            (target_index, query_index): z3m.Bool(f"x_{target_index}_{query_index}")
             for target_index, target_candidates in enumerate(candidates)
             for query_index in target_candidates
         }
 
         for target_index, target_candidates in enumerate(candidates):
-            solver.add(z3.PbEq([(assignment_variables[(target_index, query_index)], 1) for query_index in target_candidates], 1))
+            solver.add(z3m.PbEq([(assignment_variables[(target_index, query_index)], 1) for query_index in target_candidates], 1))
 
         for query_index in range(len(query_nodes)):
             uses = [
@@ -1794,7 +1993,7 @@ class Database(Generic[N, V]):
                 if query_index in target_candidates
             ]
             if uses:
-                solver.add(z3.PbLe([(query_use, 1) for query_use in uses], 1))
+                solver.add(z3m.PbLe([(query_use, 1) for query_use in uses], 1))
 
         query_successors = [set(query_data.graph.succ[node]) for node in query_nodes]
         for source, target in stored.graph.edges:
@@ -1808,9 +2007,9 @@ class Database(Generic[N, V]):
                 ]
                 for target_query_index in invalid_targets:
                     solver.add(
-                        z3.Or(
-                            z3.Not(assignment_variables[(source_index, source_query_index)]),
-                            z3.Not(assignment_variables[(target_index, target_query_index)]),
+                        z3m.Or(
+                            z3m.Not(assignment_variables[(source_index, source_query_index)]),
+                            z3m.Not(assignment_variables[(target_index, target_query_index)]),
                         )
                     )
 
@@ -1833,7 +2032,7 @@ class Database(Generic[N, V]):
                 key=repr,
             )
             identifier_variables = {
-                (identifier, query_identifier): z3.Bool(
+                (identifier, query_identifier): z3m.Bool(
                     f"y_{repr(variable_class)}_{repr(identifier)}_{repr(query_identifier)}"
                 )
                 for identifier in target_groups
@@ -1841,7 +2040,7 @@ class Database(Generic[N, V]):
             }
             for identifier in target_groups:
                 solver.add(
-                    z3.PbEq(
+                    z3m.PbEq(
                         [
                             (identifier_variables[(identifier, query_identifier)], 1)
                             for query_identifier in query_identifiers
@@ -1854,13 +2053,13 @@ class Database(Generic[N, V]):
                     for query_index in candidates[target_index]:
                         query_identifier = query_data.labels[query_nodes[query_index]][1]
                         solver.add(
-                            z3.Implies(
+                            z3m.Implies(
                                 assignment_variables[(target_index, query_index)],
                                 identifier_variables[(identifier, query_identifier)],
                             )
                         )
 
-        if solver.check() != z3.sat:
+        if solver.check() != z3m.sat:
             return None
         model = solver.model()
 
@@ -1868,7 +2067,7 @@ class Database(Generic[N, V]):
             target_node: query_nodes[query_index]
             for target_index, target_node in enumerate(order)
             for query_index in candidates[target_index]
-            if z3.is_true(model.evaluate(assignment_variables[(target_index, query_index)], model_completion=True))
+            if z3m.is_true(model.evaluate(assignment_variables[(target_index, query_index)], model_completion=True))
         }
         if len(node_mapping) != len(order):
             return None
@@ -1883,11 +2082,32 @@ class Database(Generic[N, V]):
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         if cp_model is None:
             return None
-        cp: Any = cp_model
 
         solver_candidates = self._refined_solver_candidates(stored, query_data)
         if solver_candidates is None:
             return None
+        return self._find_single_graph_match_ortools_from_candidates(stored, query_data, solver_candidates)
+
+    def _find_single_graph_match_ortools_from_masks(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+        masks: dict[N, int],
+    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        if cp_model is None:
+            return None
+        solver_candidates = self._solver_candidates_from_masks(stored, query_data, masks)
+        if solver_candidates is None:
+            return None
+        return self._find_single_graph_match_ortools_from_candidates(stored, query_data, solver_candidates)
+
+    def _find_single_graph_match_ortools_from_candidates(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+        solver_candidates: tuple[list[N], list[N], dict[N, int], list[list[int]]],
+    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        cp: Any = cp_model
         order, query_nodes, target_position, candidates = solver_candidates
 
         model: Any = cp.CpModel()
