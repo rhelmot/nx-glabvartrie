@@ -48,7 +48,7 @@ def random_connected_graph(r: Random, nodes: range, labels: range, variables: ra
 
 def is_valid_match(
     target_graph: nx.DiGraph[int],
-    target_ident: int,
+    target_idents: set[int],
     query_graph: nx.DiGraph[int],
     node_mapping: dict[int, int],
     variable_mapping: Mapping[int, Mapping[int, int]],
@@ -58,7 +58,7 @@ def is_valid_match(
         return False
     if len(set(node_mapping.values())) != len(node_mapping):
         return False
-    if target_ident not in found_idents:
+    if not target_idents.issubset(found_idents):
         return False
 
     computed_variable_mapping: defaultdict[int, dict[int, int]] = defaultdict(dict)
@@ -125,18 +125,43 @@ class TestRegressions(unittest.TestCase):
         d.index(target, 999)
 
         query = nx.DiGraph()
-        query.add_node(100, label=(3, ()), vars=())
-        query.add_node(30, label=(0, ()), vars=())
-        query.add_node(20, label=(32, ("x",)), vars=(152,))
-        query.add_node(10, label=(5, ("y",)), vars=(251,))
+        query.add_node(100, label=3, vars=())
+        query.add_node(30, label=0, vars=())
+        query.add_node(20, label=32, vars=(152,))
+        query.add_node(10, label=5, vars=(251,))
         query.add_edges_from([(100, 10), (100, 20), (100, 30)])
 
         result = list(d.query(query))
 
         assert len(result) == 1
         _, found_node_mapping, found_var_mapping, found_idents = result[0]
-        assert is_valid_match(target, 999, query, found_node_mapping, found_var_mapping, found_idents)
+        assert is_valid_match(target, {999}, query, found_node_mapping, found_var_mapping, found_idents)
 
+class TestUnits(unittest.TestCase):
+    def test_multiple_identifiers(self):
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+
+        target = nx.DiGraph()
+        target.add_node(1, label=3, vars=())
+        target.add_node(3, label=0, vars=())
+        target.add_node(2, label=32, vars=(0,))
+        target.add_node(0, label=5, vars=(3,))
+        target.add_edges_from([(1, 0), (1, 2), (1, 3)])
+        d.index(target, 999)
+        d.index(target, 998)
+
+        query = nx.DiGraph()
+        query.add_node(100, label=3, vars=())
+        query.add_node(30, label=0, vars=())
+        query.add_node(20, label=32, vars=(152,))
+        query.add_node(10, label=5, vars=(251,))
+        query.add_edges_from([(100, 10), (100, 20), (100, 30)])
+
+        result = list(d.query(query))
+
+        assert len(result) == 1
+        _, found_node_mapping, found_var_mapping, found_idents = result[0]
+        assert is_valid_match(target, {999, 998}, query, found_node_mapping, found_var_mapping, found_idents)
 
 FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
 FUZZ_OFFSET = int(os.environ.get("FUZZ_OFFSET", 0))
@@ -170,7 +195,7 @@ class TestFuzz(unittest.TestCase):
             result = list(d.query(query))
             for target_ident, target_graph in enumerate(targets):
                 for _, found_node_mapping, found_var_mapping, found_idents in result:
-                    if is_valid_match(target_graph, target_ident + 100, query, found_node_mapping, found_var_mapping, found_idents):
+                    if is_valid_match(target_graph, {target_ident + 100}, query, found_node_mapping, found_var_mapping, found_idents):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"
@@ -212,7 +237,7 @@ class TestFuzz(unittest.TestCase):
             result = list(d.query(query))
             for target_ident, target_graph in enumerate(targets):
                 for _, found_node_mapping, found_var_mapping, found_idents in result:
-                    if is_valid_match(target_graph, target_ident + 100, query, found_node_mapping, found_var_mapping, found_idents):
+                    if is_valid_match(target_graph, {target_ident + 100}, query, found_node_mapping, found_var_mapping, found_idents):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"
@@ -259,7 +284,7 @@ class TestFuzz(unittest.TestCase):
             result = list(d.query(query))
             for target_ident, target_graph in enumerate(targets):
                 for _, found_node_mapping, found_var_mapping, found_idents in result:
-                    if is_valid_match(target_graph, target_ident + 2000, query, found_node_mapping, found_var_mapping, found_idents):
+                    if is_valid_match(target_graph, {target_ident + 2000}, query, found_node_mapping, found_var_mapping, found_idents):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"
