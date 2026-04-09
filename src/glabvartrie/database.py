@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from heapq import heappop, heappush
 import os
 import time
-from typing import Any, Callable, Generic, Hashable, TypeVar
+from typing import Any, Callable, Generic, Hashable, Iterator, TypeVar
 
 import networkx as nx
 try:
@@ -32,13 +32,11 @@ def _env_enabled(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-def _iter_mask_indices(mask: int) -> list[int]:
-    indices: list[int] = []
+def _iter_mask_indices(mask: int) -> Iterator[int]:
     while mask:
         low_bit = mask & -mask
-        indices.append(low_bit.bit_length() - 1)
+        yield low_bit.bit_length() - 1
         mask ^= low_bit
-    return indices
 
 
 class _SearchTimeout(Exception):
@@ -89,30 +87,55 @@ def _articulation_points(neighbours: tuple[tuple[int, ...], ...], remaining: fro
     if len(remaining) <= 4:
         return frozenset()
 
-    remaining_set = set(remaining)
+    size = len(neighbours)
+    remaining_mask = [False] * size
+    for position in remaining:
+        remaining_mask[position] = True
+
     minimum_remaining_degree = min(
-        sum(1 for neighbour in neighbours[position] if neighbour in remaining_set)
-        for position in remaining_set
+        sum(1 for neighbour in neighbours[position] if remaining_mask[neighbour])
+        for position in remaining
     )
-    if minimum_remaining_degree * 2 >= len(remaining_set):
+    if minimum_remaining_degree * 2 >= len(remaining):
         return frozenset()
 
+    remaining_count = len(remaining)
+    root = next(iter(remaining))
+    discovery = [-1] * size
+    low = [0] * size
+    parent = [-1] * size
     articulation_points: set[int] = set()
-    for candidate in remaining:
-        start = next(iter(remaining_set - {candidate}))
-        visited = {candidate, start}
-        frontier: deque[int] = deque((start,))
+    time_counter = 0
+    visited_count = 0
 
-        while frontier:
-            current = frontier.popleft()
-            for neighbour in neighbours[current]:
-                if neighbour in visited or neighbour not in remaining_set:
-                    continue
-                visited.add(neighbour)
-                frontier.append(neighbour)
+    def dfs(position: int) -> None:
+        nonlocal time_counter, visited_count
 
-        if len(visited) != len(remaining_set):
-            articulation_points.add(candidate)
+        discovery[position] = time_counter
+        low[position] = time_counter
+        time_counter += 1
+        visited_count += 1
+
+        child_count = 0
+        for neighbour in neighbours[position]:
+            if not remaining_mask[neighbour]:
+                continue
+            if discovery[neighbour] == -1:
+                parent[neighbour] = position
+                child_count += 1
+                dfs(neighbour)
+                low[position] = min(low[position], low[neighbour])
+                if parent[position] == -1:
+                    if child_count > 1:
+                        articulation_points.add(position)
+                elif low[neighbour] >= discovery[position]:
+                    articulation_points.add(position)
+            elif neighbour != parent[position]:
+                low[position] = min(low[position], discovery[neighbour])
+
+    dfs(root)
+    if visited_count != remaining_count:
+        return remaining
 
     return frozenset(articulation_points)
 
@@ -867,14 +890,14 @@ class Database(Generic[N, V]):
         stored: _StoredGraph[N, V],
         query_data: _QueryData[N, V],
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
-        if stored.graph.number_of_nodes() < 60:
+        if stored.graph.number_of_nodes() < 50:
             return None
         if self._direct_graph_priority(stored, query_data)[0] > 16:
             return None
         match = self._find_single_graph_match_ortools(stored, query_data)
         if match is not None:
             return match
-        if self._z3_enabled and cp_model is None:
+        if self._z3_enabled:
             return self._find_single_graph_match_z3(stored, query_data)
         return None
 
@@ -1410,6 +1433,7 @@ class Database(Generic[N, V]):
         used_query_nodes: set[N],
         target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
         used_query_identifiers: dict[VariableClass, set[V]],
+        deadline: float | None = None,
     ) -> dict[N, int] | None:
         used_mask = 0
         for query_node in used_query_nodes:
@@ -1417,6 +1441,8 @@ class Database(Generic[N, V]):
 
         masks: dict[N, int] = {}
         for target_node in stored.order:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _SearchTimeout
             target_in_degree = stored.in_degrees[target_node]
             target_out_degree = stored.out_degrees[target_node]
             requires_self_loop = target_node in stored.successors[target_node]
@@ -1463,6 +1489,8 @@ class Database(Generic[N, V]):
 
             filtered_mask = 0
             for query_index in _iter_mask_indices(mask):
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise _SearchTimeout
                 query_node = query_data.index_to_node[query_index]
                 if query_data.in_degrees[query_node] < target_in_degree or query_data.out_degrees[query_node] < target_out_degree:
                     continue
@@ -1528,6 +1556,8 @@ class Database(Generic[N, V]):
                 current_mask = refined[target_node]
                 filtered_mask = 0
                 for query_index in _iter_mask_indices(current_mask):
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise _SearchTimeout
                     if self._mask_candidate_supported(
                         stored,
                         target_node,
@@ -1667,6 +1697,7 @@ class Database(Generic[N, V]):
             used_query_nodes,
             target_var_to_query_identifier,
             used_query_identifiers,
+            deadline,
         )
         if masks is None:
             return None
@@ -1692,6 +1723,45 @@ class Database(Generic[N, V]):
             deadline,
         )
 
+    def _refined_solver_candidates(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+    ) -> tuple[list[N], list[N], dict[N, int], list[list[int]]] | None:
+        order = list(stored.order)
+        query_nodes = list(query_data.graph.nodes)
+        target_position = {node: position for position, node in enumerate(order)}
+
+        masks = self._initial_single_graph_masks(
+            stored,
+            query_data,
+            {},
+            set(),
+            {},
+            {},
+        )
+        if masks is None:
+            return None
+
+        refined = self._refine_single_graph_masks(
+            stored,
+            query_data,
+            {},
+            masks,
+            None,
+        )
+        if refined is None:
+            return None
+
+        candidates = [
+            list(_iter_mask_indices(refined[target_node]))
+            for target_node in order
+        ]
+        if any(not target_candidates for target_candidates in candidates):
+            return None
+
+        return order, query_nodes, target_position, candidates
+
     def _find_single_graph_match_z3(
         self,
         stored: _StoredGraph[N, V],
@@ -1700,17 +1770,10 @@ class Database(Generic[N, V]):
         if not self._z3_enabled or z3 is None:
             return None
 
-        order = list(stored.order)
-        query_nodes = list(query_data.graph.nodes)
-        query_position = {node: position for position, node in enumerate(query_nodes)}
-        target_position = {node: position for position, node in enumerate(order)}
-
-        candidates = [
-            [query_position[query_node] for query_node in self._dynamic_candidates_for_target(stored, target_node, {}, query_data, set(), {}, {})]
-            for target_node in order
-        ]
-        if any(not target_candidates for target_candidates in candidates):
+        solver_candidates = self._refined_solver_candidates(stored, query_data)
+        if solver_candidates is None:
             return None
+        order, query_nodes, target_position, candidates = solver_candidates
 
         solver = z3.Solver()
         solver.set(timeout=10_000)
@@ -1822,17 +1885,10 @@ class Database(Generic[N, V]):
             return None
         cp: Any = cp_model
 
-        order = list(stored.order)
-        query_nodes = list(query_data.graph.nodes)
-        query_position = {node: position for position, node in enumerate(query_nodes)}
-        target_position = {node: position for position, node in enumerate(order)}
-
-        candidates = [
-            [query_position[query_node] for query_node in self._dynamic_candidates_for_target(stored, target_node, {}, query_data, set(), {}, {})]
-            for target_node in order
-        ]
-        if any(not target_candidates for target_candidates in candidates):
+        solver_candidates = self._refined_solver_candidates(stored, query_data)
+        if solver_candidates is None:
             return None
+        order, query_nodes, target_position, candidates = solver_candidates
 
         model: Any = cp.CpModel()
         assignment_variables: dict[tuple[int, int], Any] = {
@@ -1903,7 +1959,7 @@ class Database(Generic[N, V]):
                         )
 
         solver: Any = cp.CpSolver()
-        solver.parameters.max_time_in_seconds = 3.0
+        solver.parameters.max_time_in_seconds = 5.0
         solver.parameters.num_search_workers = 8
         status = solver.Solve(model)
         if status not in (cp.OPTIMAL, cp.FEASIBLE):
@@ -1955,12 +2011,20 @@ class Database(Generic[N, V]):
             ),
         )
 
-        ordered_candidates = sorted(
-            _iter_mask_indices(masks[target_node]),
-            key=lambda query_index: self._mask_candidate_order_key(stored, target_node, query_index, masks, query_data),
-        )
+        candidate_indices: Iterator[int]
+        if deadline is None:
+            candidate_indices = iter(
+                sorted(
+                    _iter_mask_indices(masks[target_node]),
+                    key=lambda query_index: self._mask_candidate_order_key(stored, target_node, query_index, masks, query_data),
+                )
+            )
+        else:
+            candidate_indices = _iter_mask_indices(masks[target_node])
 
-        for query_index in ordered_candidates:
+        for query_index in candidate_indices:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _SearchTimeout
             query_node = query_data.index_to_node[query_index]
             next_target_to_query = dict(target_to_query)
             next_target_to_query[target_node] = query_node
