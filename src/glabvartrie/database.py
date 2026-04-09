@@ -322,18 +322,25 @@ def _support_matrix(neighbours: tuple[tuple[int, ...], ...], neighbour_counts: t
     )
 
 
-def _refined_color_classes(adjacency: tuple[tuple[bool, ...], ...]) -> tuple[tuple[int, ...], ...]:
+def _refined_color_classes(
+    adjacency: tuple[tuple[bool, ...], ...],
+    initial_keys: tuple[Hashable, ...] | None = None,
+) -> tuple[tuple[int, ...], ...]:
     size = len(adjacency)
-    colors: tuple[int, ...] = tuple(
-        hash(
-            (
-                sum(adjacency[position]),
-                sum(adjacency[other][position] for other in range(size)),
-                adjacency[position][position],
+    if initial_keys is None:
+        colors = tuple(
+            hash(
+                (
+                    sum(adjacency[position]),
+                    sum(adjacency[other][position] for other in range(size)),
+                    adjacency[position][position],
+                )
             )
+            for position in range(size)
         )
-        for position in range(size)
-    )
+    else:
+        color_ids: dict[Hashable, int] = {}
+        colors = tuple(color_ids.setdefault(key, len(color_ids)) for key in initial_keys)
 
     while True:
         signatures = [
@@ -497,9 +504,16 @@ def _reduce_conditions(conditions: tuple[tuple[int, int], ...]) -> tuple[tuple[i
     return tuple(reduced)
 
 
-def _symmetry_conditions(graph: nx.DiGraph[N], order: tuple[N, ...]) -> tuple[tuple[int, int], ...]:
+def _symmetry_conditions(
+    graph: nx.DiGraph[N],
+    order: tuple[N, ...],
+    labels: dict[N, Label[V]],
+) -> tuple[tuple[int, int], ...]:
     adjacency, neighbours, neighbour_counts = _position_graph(graph, order)
-    color_classes = _refined_color_classes(adjacency)
+    color_classes = _refined_color_classes(
+        adjacency,
+        tuple(labels[node] for node in order),
+    )
     if all(len(color_class) == 1 for color_class in color_classes):
         return ()
 
@@ -660,12 +674,15 @@ class Database(Generic[N, V]):
         self._root = _TrieNode(depth=0, topology_pattern=None)
         self._z3_enabled = _env_enabled("GLABVARTRIE_ENABLE_Z3", True) and z3 is not None
 
-    def index(self, g: nx.DiGraph[N]) -> None:
-        labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
+    def _build_stored_graph(
+        self,
+        g: nx.DiGraph[N],
+        labels: dict[N, Label[V]],
+    ) -> _StoredGraph[N, V]:
         order = _topology_order(g, labels)
         topology_patterns = _topology_patterns_for_order(g, order)
         label_patterns = _label_patterns_for_order(labels, order)
-        conditions = _symmetry_conditions(g, order)
+        conditions = _symmetry_conditions(g, order, labels)
         constant_counts, variable_group_sizes = _label_stats(labels)
         order_positions = {node: position for position, node in enumerate(order)}
         variable_key_nodes_mut: defaultdict[tuple[VariableClass, V], list[N]] = defaultdict(list)
@@ -677,7 +694,6 @@ class Database(Generic[N, V]):
             variable_key_nodes_mut[(variable_class, identifier)].append(node)
             variable_class_nodes_mut[variable_class].append(node)
 
-        graph_index = len(self._graphs)
         future_out_positions_mut: list[list[int]] = [[] for _ in order]
         future_in_positions_mut: list[list[int]] = [[] for _ in order]
         for future_position, topology_pattern in enumerate(topology_patterns):
@@ -685,54 +701,59 @@ class Database(Generic[N, V]):
                 future_out_positions_mut[previous_position].append(future_position)
             for previous_position in topology_pattern.new_to_prev:
                 future_in_positions_mut[previous_position].append(future_position)
-        self._graphs.append(
-            _StoredGraph(
-                graph=g,
-                labels=labels,
-                constant_counts=constant_counts,
-                variable_group_sizes=variable_group_sizes,
-                in_degrees=dict(g.in_degree()),
-                out_degrees=dict(g.out_degree()),
-                predecessors={node: frozenset(g.pred[node]) for node in g.nodes},
-                successors={node: frozenset(g.succ[node]) for node in g.nodes},
-                neighbours={
-                    node: frozenset(set(g.pred[node]) | set(g.succ[node]))
-                    for node in g.nodes
-                },
-                order=order,
-                order_positions=order_positions,
-                variable_key_nodes={
-                    key: tuple(nodes)
-                    for key, nodes in variable_key_nodes_mut.items()
-                },
-                variable_class_nodes={
-                    variable_class: tuple(nodes)
-                    for variable_class, nodes in variable_class_nodes_mut.items()
-                },
-                topology_patterns=topology_patterns,
-                label_patterns=label_patterns,
-                condition_options=tuple(_option_for_depth(conditions, position) for position in range(len(order))),
-                full_conditions=conditions,
-                future_out_positions=tuple(tuple(positions) for positions in future_out_positions_mut),
-                future_in_positions=tuple(tuple(positions) for positions in future_in_positions_mut),
-            )
+
+        return _StoredGraph(
+            graph=g,
+            labels=labels,
+            constant_counts=constant_counts,
+            variable_group_sizes=variable_group_sizes,
+            in_degrees=dict(g.in_degree()),
+            out_degrees=dict(g.out_degree()),
+            predecessors={node: frozenset(g.pred[node]) for node in g.nodes},
+            successors={node: frozenset(g.succ[node]) for node in g.nodes},
+            neighbours={
+                node: frozenset(set(g.pred[node]) | set(g.succ[node]))
+                for node in g.nodes
+            },
+            order=order,
+            order_positions=order_positions,
+            variable_key_nodes={
+                key: tuple(nodes)
+                for key, nodes in variable_key_nodes_mut.items()
+            },
+            variable_class_nodes={
+                variable_class: tuple(nodes)
+                for variable_class, nodes in variable_class_nodes_mut.items()
+            },
+            topology_patterns=topology_patterns,
+            label_patterns=label_patterns,
+            condition_options=tuple(_option_for_depth(conditions, position) for position in range(len(order))),
+            full_conditions=conditions,
+            future_out_positions=tuple(tuple(positions) for positions in future_out_positions_mut),
+            future_in_positions=tuple(tuple(positions) for positions in future_in_positions_mut),
         )
+
+    def index(self, g: nx.DiGraph[N]) -> None:
+        labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
+        stored = self._build_stored_graph(g, labels)
+        graph_index = len(self._graphs)
+        self._graphs.append(stored)
 
         node = self._root
         node.descendant_graph_indices.add(graph_index)
-        for depth, topology_pattern in enumerate(topology_patterns, start=1):
+        for depth, topology_pattern in enumerate(stored.topology_patterns, start=1):
             child = node.children.get(topology_pattern)
             if child is None:
                 child = _TrieNode(depth=depth, topology_pattern=topology_pattern)
                 node.children[topology_pattern] = child
             child.descendant_graph_indices.add(graph_index)
-            child.label_pattern_graph_indices.setdefault(label_patterns[depth - 1], set()).add(graph_index)
-            child.condition_options.add(_option_for_depth(conditions, depth - 1))
+            child.label_pattern_graph_indices.setdefault(stored.label_patterns[depth - 1], set()).add(graph_index)
+            child.condition_options.add(_option_for_depth(stored.full_conditions, depth - 1))
             node = child
 
         node.terminal_graph_indices.append(graph_index)
         if node.full_conditions is None:
-            node.full_conditions = conditions
+            node.full_conditions = stored.full_conditions
 
     def update(self, g: nx.DiGraph[N]) -> None:
         self.index(g)
@@ -892,17 +913,186 @@ class Database(Generic[N, V]):
     ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
         if stored.graph.number_of_nodes() < 50:
             return None
-        if self._direct_graph_priority(stored, query_data)[0] > 16:
-            return None
-        match = self._find_single_graph_match_anchored(stored, query_data)
-        if match is not None:
-            return match
+        if self._direct_graph_priority(stored, query_data)[0] <= 16:
+            match = self._find_single_graph_match_scc_decomposed(stored, query_data)
+            if match is not None:
+                return match
+            match = self._find_single_graph_match_anchored(stored, query_data)
+            if match is not None:
+                return match
         match = self._find_single_graph_match_ortools(stored, query_data)
         if match is not None:
             return match
         if self._z3_enabled:
             return self._find_single_graph_match_z3(stored, query_data)
         return None
+
+    def _stored_subgraph(
+        self,
+        stored: _StoredGraph[N, V],
+        nodes: frozenset[N],
+    ) -> _StoredGraph[N, V]:
+        subgraph = nx.DiGraph(stored.graph.subgraph(nodes))
+        sublabels = {node: stored.labels[node] for node in subgraph.nodes}
+        return self._build_stored_graph(subgraph, sublabels)
+
+    def _find_single_graph_match_scc_decomposed(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        sccs = [frozenset(component) for component in nx.strongly_connected_components(stored.graph)]
+        if len(sccs) <= 1:
+            return None
+
+        component_index = {
+            node: index
+            for index, component in enumerate(sccs)
+            for node in component
+        }
+        condensation = nx.DiGraph()
+        condensation.add_nodes_from(range(len(sccs)))
+        for source, target in stored.graph.edges:
+            source_component = component_index[source]
+            target_component = component_index[target]
+            if source_component != target_component:
+                condensation.add_edge(source_component, target_component)
+        overall_deadline = time.monotonic() + 20.0
+        subgraph_cache: dict[frozenset[N], _StoredGraph[N, V]] = {}
+
+        def component_setup(
+            component_id: int,
+            target_to_query: dict[N, N],
+        ) -> tuple[
+            _StoredGraph[N, V],
+            tuple[N, ...],
+            dict[N, N],
+            set[N],
+            dict[VariableClass, dict[V, V]],
+            dict[VariableClass, set[V]],
+            tuple[int, int, int, str],
+        ] | None:
+            component_nodes = sccs[component_id]
+            boundary_nodes = {
+                neighbour
+                for node in component_nodes
+                for neighbour in stored.neighbours[node]
+                if neighbour not in component_nodes and neighbour in target_to_query
+            }
+            subgraph_nodes = frozenset(component_nodes | boundary_nodes)
+            substored = subgraph_cache.get(subgraph_nodes)
+            if substored is None:
+                substored = self._stored_subgraph(stored, subgraph_nodes)
+                subgraph_cache[subgraph_nodes] = substored
+
+            partial_mapping = {
+                node: query_node
+                for node, query_node in target_to_query.items()
+                if node in subgraph_nodes
+            }
+            used_query_nodes = set(target_to_query.values())
+            target_var_to_query_identifier, used_query_identifiers = self._variable_state(
+                stored,
+                target_to_query,
+                query_data,
+            )
+            masks = self._initial_single_graph_masks(
+                substored,
+                query_data,
+                partial_mapping,
+                used_query_nodes,
+                target_var_to_query_identifier,
+                used_query_identifiers,
+                overall_deadline,
+            )
+            if masks is None:
+                return None
+            refined = self._refine_single_graph_masks(
+                substored,
+                query_data,
+                partial_mapping,
+                masks,
+                overall_deadline,
+            )
+            if refined is None:
+                return None
+            priority = min(
+                (
+                    (
+                        -len(component_nodes),
+                        refined[target_node].bit_count(),
+                        -(substored.in_degrees[target_node] + substored.out_degrees[target_node]),
+                        repr(target_node),
+                    )
+                    for target_node in component_nodes
+                ),
+                default=(0, 0, 0, ""),
+            )
+            return (
+                substored,
+                tuple(target_node for target_node in stored.order if target_node in component_nodes),
+                partial_mapping,
+                used_query_nodes,
+                target_var_to_query_identifier,
+                used_query_identifiers,
+                priority,
+            )
+
+        def recurse(
+            target_to_query: dict[N, N],
+            assigned_components: frozenset[int],
+        ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+            if time.monotonic() >= overall_deadline:
+                raise _SearchTimeout
+            if len(assigned_components) == len(sccs):
+                ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
+                if not _conditions_hold(stored.full_conditions, ordered_query_nodes, query_data.node_ranks):
+                    return None
+                return target_to_query, self._variable_mapping(stored, query_data, ordered_query_nodes)
+
+            setups: list[tuple[int, _StoredGraph[N, V], tuple[N, ...], dict[N, N], set[N], dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]], tuple[int, int, int, str]]] = []
+            for component_id in condensation.nodes:
+                if component_id in assigned_components:
+                    continue
+                setup = component_setup(component_id, target_to_query)
+                if setup is None:
+                    continue
+                setups.append((component_id, *setup))
+            if not setups:
+                return None
+
+            component_id, substored, component_nodes, partial_mapping, used_query_nodes, target_var_to_query_identifier, used_query_identifiers, _ = min(
+                setups,
+                key=lambda item: (item[-1], item[0]),
+            )
+            match_limit = 32 if len(component_nodes) == 1 else 12
+            component_matches = self._enumerate_single_graph_matches(
+                substored,
+                query_data,
+                partial_mapping,
+                used_query_nodes,
+                target_var_to_query_identifier,
+                used_query_identifiers,
+                match_limit,
+                overall_deadline,
+            )
+            for component_mapping, _ in component_matches:
+                next_target_to_query = dict(target_to_query)
+                for node in component_nodes:
+                    query_node = component_mapping.get(node)
+                    if query_node is None:
+                        break
+                    next_target_to_query[node] = query_node
+                else:
+                    match = recurse(next_target_to_query, assigned_components | {component_id})
+                    if match is not None:
+                        return match
+            return None
+
+        try:
+            return recurse({}, frozenset())
+        except _SearchTimeout:
+            return None
 
     def _enumerate_single_graph_best_first(
         self,
@@ -1726,6 +1916,57 @@ class Database(Generic[N, V]):
             deadline,
         )
 
+    def _enumerate_single_graph_matches(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+        target_to_query: dict[N, N],
+        used_query_nodes: set[N],
+        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        used_query_identifiers: dict[VariableClass, set[V]],
+        match_limit: int,
+        deadline: float | None = None,
+    ) -> list[tuple[NodeMapping[N], VariableMapping[V]]]:
+        if not self._partial_conditions_hold(stored, target_to_query, query_data):
+            return []
+
+        masks = self._initial_single_graph_masks(
+            stored,
+            query_data,
+            target_to_query,
+            used_query_nodes,
+            target_var_to_query_identifier,
+            used_query_identifiers,
+            deadline,
+        )
+        if masks is None:
+            return []
+
+        refined = self._refine_single_graph_masks(
+            stored,
+            query_data,
+            target_to_query,
+            masks,
+            deadline,
+        )
+        if refined is None:
+            return []
+
+        variable_state = self._copy_variable_state(target_var_to_query_identifier, used_query_identifiers)
+        results: list[tuple[NodeMapping[N], VariableMapping[V]]] = []
+        self._search_single_graph_masks_collect(
+            stored,
+            query_data,
+            dict(target_to_query),
+            dict(refined),
+            variable_state[0],
+            variable_state[1],
+            results,
+            match_limit,
+            deadline,
+        )
+        return results
+
     def _solver_candidates_from_masks(
         self,
         stored: _StoredGraph[N, V],
@@ -2279,6 +2520,86 @@ class Database(Generic[N, V]):
                 return match
 
         return None
+
+    def _search_single_graph_masks_collect(
+        self,
+        stored: _StoredGraph[N, V],
+        query_data: _QueryData[N, V],
+        target_to_query: dict[N, N],
+        masks: dict[N, int],
+        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        used_query_identifiers: dict[VariableClass, set[V]],
+        results: list[tuple[NodeMapping[N], VariableMapping[V]]],
+        match_limit: int,
+        deadline: float | None = None,
+    ) -> None:
+        if len(results) >= match_limit:
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _SearchTimeout
+        if len(target_to_query) == len(stored.order):
+            ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
+            if _conditions_hold(stored.full_conditions, ordered_query_nodes, query_data.node_ranks):
+                results.append((target_to_query.copy(), self._variable_mapping(stored, query_data, ordered_query_nodes)))
+            return
+
+        frontier_targets = [
+            target_node
+            for target_node in stored.order
+            if target_node not in target_to_query
+            and any(neighbour in target_to_query for neighbour in stored.neighbours[target_node])
+        ]
+        candidate_targets = frontier_targets or [target_node for target_node in stored.order if target_node not in target_to_query]
+        target_node = min(
+            candidate_targets,
+            key=lambda current_target: (
+                masks[current_target].bit_count(),
+                -(stored.in_degrees[current_target] + stored.out_degrees[current_target]),
+                repr(current_target),
+            ),
+        )
+
+        candidate_indices = sorted(
+            _iter_mask_indices(masks[target_node]),
+            key=lambda query_index: self._mask_candidate_order_key(stored, target_node, query_index, masks, query_data),
+        )
+        for query_index in candidate_indices:
+            if len(results) >= match_limit:
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _SearchTimeout
+            query_node = query_data.index_to_node[query_index]
+            next_target_to_query = dict(target_to_query)
+            next_target_to_query[target_node] = query_node
+            if not self._partial_conditions_hold(stored, next_target_to_query, query_data):
+                continue
+
+            propagated = self._propagate_assignment_masks(
+                stored,
+                query_data,
+                next_target_to_query,
+                masks,
+                target_node,
+                query_index,
+                target_var_to_query_identifier,
+                used_query_identifiers,
+                deadline,
+            )
+            if propagated is None:
+                continue
+
+            next_masks, next_target_var_to_query_identifier, next_used_query_identifiers = propagated
+            self._search_single_graph_masks_collect(
+                stored,
+                query_data,
+                next_target_to_query,
+                next_masks,
+                next_target_var_to_query_identifier,
+                next_used_query_identifiers,
+                results,
+                match_limit,
+                deadline,
+            )
 
     def _dynamic_label_candidates(
         self,
