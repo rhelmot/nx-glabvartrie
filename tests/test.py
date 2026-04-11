@@ -7,6 +7,7 @@ from collections import defaultdict
 from random import Random
 
 import networkx as nx
+from networkx.algorithms.isomorphism import DiGraphMatcher
 
 from glabvartrie import Database
 
@@ -112,6 +113,48 @@ def embed_graph(query: nx.DiGraph[int], t: nx.DiGraph[int], available_nodes: lis
             for slot, identifier in enumerate(t.nodes[n]['vars'])
         )
 
+
+def corresponds_to_witness_graph(target_graph: nx.DiGraph[int], witness_graph: nx.DiGraph[int]) -> bool:
+    if target_graph.number_of_nodes() != witness_graph.number_of_nodes():
+        return False
+    if target_graph.number_of_edges() != witness_graph.number_of_edges():
+        return False
+
+    matcher = DiGraphMatcher(
+        target_graph,
+        witness_graph,
+        node_match=lambda left_attrs, right_attrs: (
+            left_attrs["label"] == right_attrs["label"]
+            and len(left_attrs["vars"]) == len(right_attrs["vars"])
+        ),
+    )
+
+    for mapping in matcher.isomorphisms_iter():
+        target_to_witness_vars: defaultdict[int, dict[int, int]] = defaultdict(dict)
+        witness_to_target_vars: defaultdict[int, dict[int, int]] = defaultdict(dict)
+        for target_node, witness_node in mapping.items():
+            target_vars = target_graph.nodes[target_node]["vars"]
+            witness_vars = witness_graph.nodes[witness_node]["vars"]
+            if len(target_vars) != len(witness_vars):
+                break
+            for slot, target_identifier in enumerate(target_vars):
+                witness_identifier = witness_vars[slot]
+                existing = target_to_witness_vars[slot].get(target_identifier)
+                if existing is not None and existing != witness_identifier:
+                    break
+                reverse_existing = witness_to_target_vars[slot].get(witness_identifier)
+                if reverse_existing is not None and reverse_existing != target_identifier:
+                    break
+                target_to_witness_vars[slot][target_identifier] = witness_identifier
+                witness_to_target_vars[slot][witness_identifier] = target_identifier
+            else:
+                continue
+            break
+        else:
+            return True
+
+    return False
+
 class TestRegressions(unittest.TestCase):
     def test_label_aware_symmetry_conditions(self):
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
@@ -134,21 +177,29 @@ class TestRegressions(unittest.TestCase):
         result = list(d.query(query))
 
         assert len(result) == 1
-        _, found_node_mapping, found_var_mapping, found_idents = result[0]
-        assert is_valid_match(target, {999}, query, found_node_mapping, found_var_mapping, found_idents)
+        witness_graph, found_node_mapping, found_var_mapping, found_idents = result[0]
+        assert corresponds_to_witness_graph(target, witness_graph)
+        assert is_valid_match(witness_graph, {999}, query, found_node_mapping, found_var_mapping, found_idents)
 
 class TestUnits(unittest.TestCase):
     def test_multiple_identifiers(self):
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
 
-        target = nx.DiGraph()
-        target.add_node(1, label=3, vars=())
-        target.add_node(3, label=0, vars=())
-        target.add_node(2, label=32, vars=(0,))
-        target.add_node(0, label=5, vars=(3,))
-        target.add_edges_from([(1, 0), (1, 2), (1, 3)])
-        d.index(target, 999)
-        d.index(target, 998)
+        first_target = nx.DiGraph()
+        first_target.add_node(1, label=3, vars=())
+        first_target.add_node(3, label=0, vars=())
+        first_target.add_node(2, label=32, vars=(0,))
+        first_target.add_node(0, label=5, vars=(3,))
+        first_target.add_edges_from([(1, 0), (1, 2), (1, 3)])
+        d.index(first_target, 999)
+
+        second_target = nx.DiGraph()
+        second_target.add_node(0, label=3, vars=())
+        second_target.add_node(1, label=0, vars=())
+        second_target.add_node(2, label=32, vars=(1,))
+        second_target.add_node(3, label=5, vars=(4,))
+        second_target.add_edges_from([(0, 1), (0, 2), (0, 3)])
+        d.index(second_target, 998)
 
         query = nx.DiGraph()
         query.add_node(100, label=3, vars=())
@@ -160,8 +211,13 @@ class TestUnits(unittest.TestCase):
         result = list(d.query(query))
 
         assert len(result) == 1
-        _, found_node_mapping, found_var_mapping, found_idents = result[0]
-        assert is_valid_match(target, {999, 998}, query, found_node_mapping, found_var_mapping, found_idents)
+        witness_graph, found_node_mapping, found_var_mapping, found_idents = result[0]
+        assert corresponds_to_witness_graph(first_target, witness_graph)
+        assert corresponds_to_witness_graph(second_target, witness_graph)
+        assert is_valid_match(witness_graph, {999, 998}, query, found_node_mapping, found_var_mapping, found_idents)
+        assert set(found_var_mapping) == {0}
+        assert set(found_var_mapping[0]) == {0, 3}
+        assert set(found_var_mapping[0].values()) == {152, 251}
 
 FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
 FUZZ_OFFSET = int(os.environ.get("FUZZ_OFFSET", 0))
@@ -194,8 +250,11 @@ class TestFuzz(unittest.TestCase):
 
             result = list(d.query(query))
             for target_ident, target_graph in enumerate(targets):
-                for _, found_node_mapping, found_var_mapping, found_idents in result:
-                    if is_valid_match(target_graph, {target_ident + 100}, query, found_node_mapping, found_var_mapping, found_idents):
+                for witness_graph, found_node_mapping, found_var_mapping, found_idents in result:
+                    if (
+                        corresponds_to_witness_graph(target_graph, witness_graph)
+                        and is_valid_match(witness_graph, {target_ident + 100}, query, found_node_mapping, found_var_mapping, found_idents)
+                    ):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"
@@ -236,8 +295,11 @@ class TestFuzz(unittest.TestCase):
 
             result = list(d.query(query))
             for target_ident, target_graph in enumerate(targets):
-                for _, found_node_mapping, found_var_mapping, found_idents in result:
-                    if is_valid_match(target_graph, {target_ident + 100}, query, found_node_mapping, found_var_mapping, found_idents):
+                for witness_graph, found_node_mapping, found_var_mapping, found_idents in result:
+                    if (
+                        corresponds_to_witness_graph(target_graph, witness_graph)
+                        and is_valid_match(witness_graph, {target_ident + 100}, query, found_node_mapping, found_var_mapping, found_idents)
+                    ):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"
@@ -283,8 +345,11 @@ class TestFuzz(unittest.TestCase):
 
             result = list(d.query(query))
             for target_ident, target_graph in enumerate(targets):
-                for _, found_node_mapping, found_var_mapping, found_idents in result:
-                    if is_valid_match(target_graph, {target_ident + 2000}, query, found_node_mapping, found_var_mapping, found_idents):
+                for witness_graph, found_node_mapping, found_var_mapping, found_idents in result:
+                    if (
+                        corresponds_to_witness_graph(target_graph, witness_graph)
+                        and is_valid_match(witness_graph, {target_ident + 2000}, query, found_node_mapping, found_var_mapping, found_idents)
+                    ):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"

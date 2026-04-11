@@ -7,6 +7,8 @@ import os
 from typing import Any, Callable, Generic, Hashable, Iterator, TypeAlias, TypeVar
 
 import networkx as nx
+from networkx.algorithms.graph_hashing import weisfeiler_lehman_graph_hash
+from networkx.algorithms.isomorphism import DiGraphMatcher
 try:
     from ortools.sat.python import cp_model
 except Exception:
@@ -21,10 +23,15 @@ L = TypeVar("L", bound=Hashable)
 V = TypeVar("V", bound=Hashable)
 I = TypeVar("I", bound=Hashable)
 VariableClass: TypeAlias = int
+CanonicalNode: TypeAlias = int
+CanonicalVariable: TypeAlias = int
 Label: TypeAlias = L
 Variables: TypeAlias = tuple[V, ...]
+CanonicalVariables: TypeAlias = tuple[CanonicalVariable, ...]
 NodeMapping: TypeAlias = dict[N, N]
+CanonicalNodeMapping: TypeAlias = dict[CanonicalNode, N]
 VariableMapping: TypeAlias = dict[VariableClass, dict[V, V]]
+CanonicalVariableMapping: TypeAlias = dict[VariableClass, dict[CanonicalVariable, V]]
 MatchResult: TypeAlias = tuple["nx.DiGraph[N]", NodeMapping[N], VariableMapping[V], set[I]]
 
 
@@ -570,20 +577,23 @@ def _symmetry_conditions(
 
 @dataclass(slots=True)
 class _StoredGraph(Generic[N, L, V]):
-    graph: nx.DiGraph[N]
-    labels: dict[N, L]
-    variables: dict[N, Variables[V]]
+    graph: nx.DiGraph[CanonicalNode]
+    labels: dict[CanonicalNode, L]
+    variables: dict[CanonicalNode, CanonicalVariables]
+    witness_graph: nx.DiGraph[N]
+    canonical_to_witness_nodes: dict[CanonicalNode, N]
+    canonical_to_witness_variables: dict[VariableClass, dict[CanonicalVariable, V]]
     constant_counts: Counter[L]
     variable_group_sizes: dict[VariableClass, tuple[int, ...]]
-    in_degrees: dict[N, int]
-    out_degrees: dict[N, int]
-    predecessors: dict[N, frozenset[N]]
-    successors: dict[N, frozenset[N]]
-    neighbours: dict[N, frozenset[N]]
-    order: tuple[N, ...]
-    order_positions: dict[N, int]
-    variable_key_nodes: dict[tuple[VariableClass, V], tuple[N, ...]]
-    variable_class_nodes: dict[VariableClass, tuple[N, ...]]
+    in_degrees: dict[CanonicalNode, int]
+    out_degrees: dict[CanonicalNode, int]
+    predecessors: dict[CanonicalNode, frozenset[CanonicalNode]]
+    successors: dict[CanonicalNode, frozenset[CanonicalNode]]
+    neighbours: dict[CanonicalNode, frozenset[CanonicalNode]]
+    order: tuple[CanonicalNode, ...]
+    order_positions: dict[CanonicalNode, int]
+    variable_key_nodes: dict[tuple[VariableClass, CanonicalVariable], tuple[CanonicalNode, ...]]
+    variable_class_nodes: dict[VariableClass, tuple[CanonicalNode, ...]]
     topology_patterns: tuple[_TopologyPattern, ...]
     label_patterns: tuple[_LabelPattern[L], ...]
     condition_options: tuple[_ConditionOption, ...]
@@ -629,9 +639,9 @@ class _QueryData(Generic[N, L, V]):
 
 @dataclass(slots=True)
 class _DynamicSearchState(Generic[N, V]):
-    target_to_query: dict[N, N]
+    target_to_query: CanonicalNodeMapping[N]
     used_query_nodes: set[N]
-    target_var_to_query_identifier: dict[VariableClass, dict[V, V]]
+    target_var_to_query_identifier: CanonicalVariableMapping[V]
     used_query_identifiers: dict[VariableClass, set[V]]
 
 def _build_query_data(
@@ -699,6 +709,7 @@ class Database(Generic[N, L, V, I]):
         self._node_vars = node_vars
         self._graphs: list[_StoredGraph[N, L, V]] = []
         self._idents: list[set[I]] = []
+        self._canonical_buckets: defaultdict[tuple[Any, ...], list[int]] = defaultdict(list)
         self._root = _TrieNode(depth=0, topology_pattern=None)
         self._heuristic_fallbacks_enabled = _env_enabled("GLABVARTRIE_ENABLE_HEURISTIC_FALLBACKS", True)
         self._ortools_enabled = _env_enabled("GLABVARTRIE_ENABLE_ORTOOLS", True) and cp_model is not None
@@ -718,9 +729,12 @@ class Database(Generic[N, L, V, I]):
 
     def _build_stored_graph(
         self,
-        g: nx.DiGraph[N],
-        labels: dict[N, L],
-        variables: dict[N, Variables[V]],
+        g: nx.DiGraph[CanonicalNode],
+        labels: dict[CanonicalNode, L],
+        variables: dict[CanonicalNode, CanonicalVariables],
+        witness_graph: nx.DiGraph[N],
+        canonical_to_witness_nodes: dict[CanonicalNode, N],
+        canonical_to_witness_variables: dict[VariableClass, dict[CanonicalVariable, V]],
     ) -> _StoredGraph[N, L, V]:
         order = _topology_order(g, labels)
         topology_patterns = _topology_patterns_for_order(g, order)
@@ -728,8 +742,8 @@ class Database(Generic[N, L, V, I]):
         conditions = _symmetry_conditions(g, order, labels, variables)
         constant_counts, variable_group_sizes = _label_stats(labels, variables)
         order_positions = {node: position for position, node in enumerate(order)}
-        variable_key_nodes_mut: defaultdict[tuple[VariableClass, V], list[N]] = defaultdict(list)
-        variable_class_nodes_mut: defaultdict[VariableClass, list[N]] = defaultdict(list)
+        variable_key_nodes_mut: defaultdict[tuple[VariableClass, CanonicalVariable], list[CanonicalNode]] = defaultdict(list)
+        variable_class_nodes_mut: defaultdict[VariableClass, list[CanonicalNode]] = defaultdict(list)
         for node in order:
             for variable_class, identifier in enumerate(variables[node]):
                 variable_key_nodes_mut[(variable_class, identifier)].append(node)
@@ -747,6 +761,9 @@ class Database(Generic[N, L, V, I]):
             graph=g,
             labels=labels,
             variables=variables,
+            witness_graph=witness_graph,
+            canonical_to_witness_nodes=canonical_to_witness_nodes,
+            canonical_to_witness_variables=canonical_to_witness_variables,
             constant_counts=constant_counts,
             variable_group_sizes=variable_group_sizes,
             in_degrees=dict(g.in_degree()),
@@ -775,13 +792,173 @@ class Database(Generic[N, L, V, I]):
             future_in_positions=tuple(tuple(positions) for positions in future_in_positions_mut),
         )
 
+    def _canonicalize_index_variables(
+        self,
+        order: tuple[N, ...],
+        variables: dict[N, Variables[V]],
+    ) -> dict[N, CanonicalVariables]:
+        canonical_identifiers_by_class: defaultdict[VariableClass, dict[V, int]] = defaultdict(dict)
+        canonical_variables_mut: dict[N, CanonicalVariables] = {}
+
+        for node in order:
+            canonical_variables_mut[node] = tuple(
+                canonical_identifiers_by_class[variable_class].setdefault(identifier, len(canonical_identifiers_by_class[variable_class]))
+                for variable_class, identifier in enumerate(variables[node])
+            )
+
+        return canonical_variables_mut
+
+    def _canonicalize_index_graph(
+        self,
+        g: nx.DiGraph[N],
+        labels: dict[N, L],
+        variables: dict[N, Variables[V]],
+    ) -> tuple[
+        nx.DiGraph[CanonicalNode],
+        dict[CanonicalNode, L],
+        dict[CanonicalNode, CanonicalVariables],
+        dict[CanonicalNode, N],
+        dict[VariableClass, dict[CanonicalVariable, V]],
+    ]:
+        order = _topology_order(g, labels)
+        canonical_variables_by_original = self._canonicalize_index_variables(order, variables)
+        canonical_node_by_original = {
+            original_node: canonical_node
+            for canonical_node, original_node in enumerate(order)
+        }
+        canonical_to_witness_node = {
+            canonical_node: original_node
+            for original_node, canonical_node in canonical_node_by_original.items()
+        }
+        canonical_graph: nx.DiGraph[CanonicalNode] = nx.DiGraph()
+        canonical_graph.graph.update(g.graph)
+        canonical_graph.graph["_glabvartrie_canonical"] = True
+        canonical_labels: dict[CanonicalNode, L] = {}
+        canonical_variables: dict[CanonicalNode, CanonicalVariables] = {}
+        canonical_to_original_variables: defaultdict[VariableClass, dict[CanonicalVariable, V]] = defaultdict(dict)
+
+        for original_node in order:
+            canonical_node = canonical_node_by_original[original_node]
+            canonical_vars = canonical_variables_by_original[original_node]
+            node_attrs = dict(g.nodes[original_node])
+            if node_attrs.get("vars") == variables[original_node]:
+                node_attrs["vars"] = canonical_vars
+            if node_attrs.get("label") == labels[original_node]:
+                node_attrs["label"] = labels[original_node]
+            node_attrs["_glabvartrie_original_node"] = original_node
+            node_attrs["_glabvartrie_label"] = labels[original_node]
+            node_attrs["_glabvartrie_vars"] = canonical_vars
+            canonical_graph.add_node(canonical_node, **node_attrs)
+            canonical_labels[canonical_node] = labels[original_node]
+            canonical_variables[canonical_node] = canonical_vars
+            for variable_class, original_identifier in enumerate(variables[original_node]):
+                canonical_identifier = canonical_vars[variable_class]
+                canonical_to_original_variables[variable_class].setdefault(canonical_identifier, original_identifier)
+
+        for source, target, edge_attrs in g.edges(data=True):
+            canonical_graph.add_edge(
+                canonical_node_by_original[source],
+                canonical_node_by_original[target],
+                **dict(edge_attrs),
+            )
+
+        return (
+            canonical_graph,
+            canonical_labels,
+            canonical_variables,
+            canonical_to_witness_node,
+            dict(canonical_to_original_variables),
+        )
+
+    def _equivalence_graph(self, stored: _StoredGraph[N, L, V]) -> nx.DiGraph[N]:
+        graph = nx.DiGraph()
+        for node in stored.graph.nodes:
+            graph.add_node(
+                node,
+                canon_label=repr((stored.labels[node], len(stored.variables[node]))),
+            )
+        graph.add_edges_from(stored.graph.edges)
+        return graph
+
+    def _canonical_bucket_key(self, stored: _StoredGraph[N, L, V]) -> tuple[Any, ...]:
+        equivalence_graph = self._equivalence_graph(stored)
+        return (
+            stored.graph.number_of_nodes(),
+            stored.graph.number_of_edges(),
+            tuple(sorted(stored.constant_counts.items(), key=lambda item: repr(item[0]))),
+            tuple(sorted(stored.variable_group_sizes.items(), key=lambda item: item[0])),
+            weisfeiler_lehman_graph_hash(equivalence_graph, node_attr="canon_label"),
+        )
+
+    def _stored_graphs_equivalent(
+        self,
+        left: _StoredGraph[N, L, V],
+        right: _StoredGraph[N, L, V],
+    ) -> bool:
+        if left.graph.number_of_nodes() != right.graph.number_of_nodes():
+            return False
+        if left.graph.number_of_edges() != right.graph.number_of_edges():
+            return False
+        if left.constant_counts != right.constant_counts:
+            return False
+        if left.variable_group_sizes != right.variable_group_sizes:
+            return False
+
+        left_graph = self._equivalence_graph(left)
+        right_graph = self._equivalence_graph(right)
+        matcher = DiGraphMatcher(
+            left_graph,
+            right_graph,
+            node_match=lambda left_attrs, right_attrs: left_attrs["canon_label"] == right_attrs["canon_label"],
+        )
+
+        for mapping in matcher.isomorphisms_iter():
+            slot_mapping: dict[int, dict[CanonicalVariable, CanonicalVariable]] = defaultdict(dict)
+            reverse_slot_mapping: dict[int, dict[CanonicalVariable, CanonicalVariable]] = defaultdict(dict)
+            for left_node, right_node in mapping.items():
+                left_vars = left.variables[left_node]
+                right_vars = right.variables[right_node]
+                if len(left_vars) != len(right_vars):
+                    break
+                for slot, left_identifier in enumerate(left_vars):
+                    right_identifier = right_vars[slot]
+                    existing = slot_mapping[slot].get(left_identifier)
+                    if existing is not None and existing != right_identifier:
+                        break
+                    reverse_existing = reverse_slot_mapping[slot].get(right_identifier)
+                    if reverse_existing is not None and reverse_existing != left_identifier:
+                        break
+                    slot_mapping[slot][left_identifier] = right_identifier
+                    reverse_slot_mapping[slot][right_identifier] = left_identifier
+                else:
+                    continue
+                break
+            else:
+                return True
+
+        return False
+
     def index(self, g: nx.DiGraph[N], ident: I) -> None:
         labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
         variables = {node: self._node_vars(g.nodes[node]) for node in g.nodes}
-        stored = self._build_stored_graph(g, labels, variables)
+        canonical_graph, canonical_labels, canonical_variables, canonical_to_witness_nodes, canonical_to_witness_variables = self._canonicalize_index_graph(g, labels, variables)
+        stored = self._build_stored_graph(
+            canonical_graph,
+            canonical_labels,
+            canonical_variables,
+            witness_graph=g.copy(),
+            canonical_to_witness_nodes=canonical_to_witness_nodes,
+            canonical_to_witness_variables=canonical_to_witness_variables,
+        )
+        bucket_key = self._canonical_bucket_key(stored)
+        for graph_index in self._canonical_buckets[bucket_key]:
+            if self._stored_graphs_equivalent(self._graphs[graph_index], stored):
+                self._idents[graph_index].add(ident)
+                return
         graph_index = len(self._graphs)
         self._graphs.append(stored)
         self._idents.append({ident})
+        self._canonical_buckets[bucket_key].append(graph_index)
 
         node = self._root
         node.descendant_graph_indices.add(graph_index)
@@ -895,7 +1072,7 @@ class Database(Generic[N, L, V, I]):
             return 0
 
         stored = self._graphs[graph_index]
-        local_matches: list[tuple[NodeMapping[N], VariableMapping[V]]] = []
+        local_matches: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]] = []
         if match_limit > 1:
             self._enumerate_single_graph_best_first(
                 stored,
@@ -905,7 +1082,7 @@ class Database(Generic[N, L, V, I]):
                 use_lookahead,
             )
         else:
-            match: tuple[NodeMapping[N], VariableMapping[V]] | None
+            match: tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None
             try:
                 budget = self._native_budget(stored)
                 match = self._find_single_graph_match(
@@ -930,9 +1107,9 @@ class Database(Generic[N, L, V, I]):
 
     def _copy_variable_state(
         self,
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
-    ) -> tuple[dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]]]:
+    ) -> tuple[CanonicalVariableMapping[V], dict[VariableClass, set[V]]]:
         return (
             {
                 variable_class: dict(identifier_mapping)
@@ -961,23 +1138,36 @@ class Database(Generic[N, L, V, I]):
         self,
         matches: list[MatchResult[N, V, I]],
         graph_index: int,
-        node_mapping: NodeMapping[N],
-        variable_mapping: VariableMapping[V],
+        node_mapping: CanonicalNodeMapping[N],
+        variable_mapping: CanonicalVariableMapping[V],
     ) -> None:
-        signature = self._match_signature(node_mapping, variable_mapping)
+        stored = self._graphs[graph_index]
+        witness_node_mapping = {
+            stored.canonical_to_witness_nodes[target_node]: query_node
+            for target_node, query_node in node_mapping.items()
+        }
+        witness_variable_mapping: dict[VariableClass, dict[V, V]] = {}
+        for variable_class, identifier_mapping in variable_mapping.items():
+            witness_identifier_mapping: dict[V, V] = {}
+            canonical_to_witness_identifiers = stored.canonical_to_witness_variables.get(variable_class, {})
+            for canonical_identifier, query_identifier in identifier_mapping.items():
+                witness_identifier_mapping[canonical_to_witness_identifiers[canonical_identifier]] = query_identifier
+            witness_variable_mapping[variable_class] = witness_identifier_mapping
+
+        signature = self._match_signature(witness_node_mapping, witness_variable_mapping)
         for match_index, (graph, existing_node_mapping, existing_variable_mapping, identifiers) in enumerate(matches):
             del graph
             if self._match_signature(existing_node_mapping, existing_variable_mapping) != signature:
                 continue
             identifiers.update(self._idents[graph_index])
             return
-        matches.append((self._graphs[graph_index].graph, node_mapping, variable_mapping, set(self._idents[graph_index])))
+        matches.append((stored.witness_graph, witness_node_mapping, witness_variable_mapping, set(self._idents[graph_index])))
 
     def _timeout_fallback_match(
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         if stored.graph.number_of_nodes() < 50:
             return None
         if self._heuristic_fallbacks_enabled and self._direct_graph_priority(stored, query_data)[0] <= 16:
@@ -998,18 +1188,39 @@ class Database(Generic[N, L, V, I]):
     def _stored_subgraph(
         self,
         stored: _StoredGraph[N, L, V],
-        nodes: frozenset[N],
+        nodes: frozenset[CanonicalNode],
     ) -> _StoredGraph[N, L, V]:
         subgraph = nx.DiGraph(stored.graph.subgraph(nodes))
         sublabels = {node: stored.labels[node] for node in subgraph.nodes}
         subvars = {node: stored.variables[node] for node in subgraph.nodes}
-        return self._build_stored_graph(subgraph, sublabels, subvars)
+        witness_nodes = [stored.canonical_to_witness_nodes[node] for node in subgraph.nodes]
+        witness_subgraph = nx.DiGraph(stored.witness_graph.subgraph(witness_nodes))
+        canonical_to_witness_nodes = {
+            node: stored.canonical_to_witness_nodes[node]
+            for node in subgraph.nodes
+        }
+        canonical_to_witness_variables = {
+            variable_class: {
+                canonical_identifier: witness_identifier
+                for canonical_identifier, witness_identifier in identifier_mapping.items()
+                if any(canonical_identifier in stored.variables[node] for node in subgraph.nodes)
+            }
+            for variable_class, identifier_mapping in stored.canonical_to_witness_variables.items()
+        }
+        return self._build_stored_graph(
+            subgraph,
+            sublabels,
+            subvars,
+            witness_subgraph,
+            canonical_to_witness_nodes,
+            canonical_to_witness_variables,
+        )
 
     def _find_single_graph_match_scc_decomposed(
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         sccs = [frozenset(component) for component in nx.strongly_connected_components(stored.graph)]
         if len(sccs) <= 1:
             return None
@@ -1027,17 +1238,17 @@ class Database(Generic[N, L, V, I]):
             if source_component != target_component:
                 condensation.add_edge(source_component, target_component)
         budget = _OperationBudget(self._scc_ops)
-        subgraph_cache: dict[frozenset[N], _StoredGraph[N, L, V]] = {}
+        subgraph_cache: dict[frozenset[CanonicalNode], _StoredGraph[N, L, V]] = {}
 
         def component_setup(
             component_id: int,
-            target_to_query: dict[N, N],
+            target_to_query: CanonicalNodeMapping[N],
         ) -> tuple[
             _StoredGraph[N, L, V],
-            tuple[N, ...],
-            dict[N, N],
+            tuple[CanonicalNode, ...],
+            CanonicalNodeMapping[N],
             set[N],
-            dict[VariableClass, dict[V, V]],
+            CanonicalVariableMapping[V],
             dict[VariableClass, set[V]],
             tuple[int, int, int, str],
         ] | None:
@@ -1108,9 +1319,9 @@ class Database(Generic[N, L, V, I]):
             )
 
         def recurse(
-            target_to_query: dict[N, N],
+            target_to_query: CanonicalNodeMapping[N],
             assigned_components: frozenset[int],
-        ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
             _spend(budget)
             if len(assigned_components) == len(sccs):
                 ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
@@ -1118,7 +1329,7 @@ class Database(Generic[N, L, V, I]):
                     return None
                 return target_to_query, self._variable_mapping(stored, query_data, ordered_query_nodes)
 
-            setups: list[tuple[int, _StoredGraph[N, L, V], tuple[N, ...], dict[N, N], set[N], dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]], tuple[int, int, int, str]]] = []
+            setups: list[tuple[int, _StoredGraph[N, L, V], tuple[CanonicalNode, ...], CanonicalNodeMapping[N], set[N], CanonicalVariableMapping[V], dict[VariableClass, set[V]], tuple[int, int, int, str]]] = []
             for component_id in condensation.nodes:
                 if component_id in assigned_components:
                     continue
@@ -1166,7 +1377,7 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        results: list[tuple[NodeMapping[N], VariableMapping[V]]],
+        results: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]],
         match_limit: int,
         use_lookahead: bool,
     ) -> None:
@@ -1390,10 +1601,10 @@ class Database(Generic[N, L, V, I]):
     def _variable_state(
         self,
         stored: _StoredGraph[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         query_data: _QueryData[N, L, V],
-    ) -> tuple[dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]]]:
-        target_var_to_query_identifier: defaultdict[VariableClass, dict[V, V]] = defaultdict(dict)
+    ) -> tuple[CanonicalVariableMapping[V], dict[VariableClass, set[V]]]:
+        target_var_to_query_identifier: defaultdict[VariableClass, dict[CanonicalVariable, V]] = defaultdict(dict)
         used_query_identifiers: defaultdict[VariableClass, set[V]] = defaultdict(set)
 
         for target_node, query_node in target_to_query.items():
@@ -1415,7 +1626,7 @@ class Database(Generic[N, L, V, I]):
     def _partial_conditions_hold(
         self,
         stored: _StoredGraph[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         query_data: _QueryData[N, L, V],
     ) -> bool:
         for left_position, right_position in stored.full_conditions:
@@ -1431,12 +1642,12 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         used_query_nodes: set[N],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
-    ) -> dict[N, frozenset[N]] | None:
-        domains: dict[N, frozenset[N]] = {}
+    ) -> dict[CanonicalNode, frozenset[N]] | None:
+        domains: dict[CanonicalNode, frozenset[N]] = {}
 
         for target_node in stored.order:
             assigned_query = target_to_query.get(target_node)
@@ -1500,10 +1711,10 @@ class Database(Generic[N, L, V, I]):
     def _target_candidate_supported(
         self,
         stored: _StoredGraph[N, L, V],
-        target_node: N,
+        target_node: CanonicalNode,
         query_node: N,
-        domains: dict[N, frozenset[N]],
-        target_to_query: dict[N, N],
+        domains: dict[CanonicalNode, frozenset[N]],
+        target_to_query: CanonicalNodeMapping[N],
         query_data: _QueryData[N, L, V],
     ) -> bool:
         if target_node in stored.successors[target_node] and not query_data.graph.has_edge(query_node, query_node):
@@ -1535,9 +1746,9 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
-        domains: dict[N, frozenset[N]],
-    ) -> dict[N, frozenset[N]] | None:
+        target_to_query: CanonicalNodeMapping[N],
+        domains: dict[CanonicalNode, frozenset[N]],
+    ) -> dict[CanonicalNode, frozenset[N]] | None:
         refined = dict(domains)
 
         changed = True
@@ -1568,9 +1779,9 @@ class Database(Generic[N, L, V, I]):
     def _candidate_order_key(
         self,
         stored: _StoredGraph[N, L, V],
-        target_node: N,
+        target_node: CanonicalNode,
         query_node: N,
-        domains: dict[N, frozenset[N]],
+        domains: dict[CanonicalNode, frozenset[N]],
         query_data: _QueryData[N, L, V],
     ) -> tuple[int, int, str]:
         impact = 0
@@ -1590,13 +1801,13 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
-        domains: dict[N, frozenset[N]],
-        assigned_target: N,
+        target_to_query: CanonicalNodeMapping[N],
+        domains: dict[CanonicalNode, frozenset[N]],
+        assigned_target: CanonicalNode,
         assigned_query: N,
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
-    ) -> tuple[dict[N, frozenset[N]], dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]]] | None:
+    ) -> tuple[dict[CanonicalNode, frozenset[N]], CanonicalVariableMapping[V], dict[VariableClass, set[V]]] | None:
         next_domains = dict(domains)
         next_domains[assigned_target] = frozenset((assigned_query,))
 
@@ -1668,9 +1879,9 @@ class Database(Generic[N, L, V, I]):
     def _bitmask_label_candidates(
         self,
         stored: _StoredGraph[N, L, V],
-        target_node: N,
+        target_node: CanonicalNode,
         query_data: _QueryData[N, L, V],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> int:
         del used_query_identifiers
@@ -1690,17 +1901,17 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         used_query_nodes: set[N],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
         budget: _OperationBudget | None = None,
-    ) -> dict[N, int] | None:
+    ) -> dict[CanonicalNode, int] | None:
         used_mask = 0
         for query_node in used_query_nodes:
             used_mask |= 1 << query_data.node_indices[query_node]
 
-        masks: dict[N, int] = {}
+        masks: dict[CanonicalNode, int] = {}
         for target_node in stored.order:
             _spend(budget)
             target_in_degree = stored.in_degrees[target_node]
@@ -1768,10 +1979,10 @@ class Database(Generic[N, L, V, I]):
     def _mask_candidate_supported(
         self,
         stored: _StoredGraph[N, L, V],
-        target_node: N,
+        target_node: CanonicalNode,
         query_index: int,
-        masks: dict[N, int],
-        target_to_query: dict[N, N],
+        masks: dict[CanonicalNode, int],
+        target_to_query: CanonicalNodeMapping[N],
         query_data: _QueryData[N, L, V],
     ) -> bool:
         query_node = query_data.index_to_node[query_index]
@@ -1802,10 +2013,10 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
-        masks: dict[N, int],
+        target_to_query: CanonicalNodeMapping[N],
+        masks: dict[CanonicalNode, int],
         budget: _OperationBudget | None = None,
-    ) -> dict[N, int] | None:
+    ) -> dict[CanonicalNode, int] | None:
         refined = dict(masks)
 
         changed = True
@@ -1837,9 +2048,9 @@ class Database(Generic[N, L, V, I]):
     def _mask_candidate_order_key(
         self,
         stored: _StoredGraph[N, L, V],
-        target_node: N,
+        target_node: CanonicalNode,
         query_index: int,
-        masks: dict[N, int],
+        masks: dict[CanonicalNode, int],
         query_data: _QueryData[N, L, V],
     ) -> tuple[int, int, str]:
         impact = 0
@@ -1862,14 +2073,14 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
-        masks: dict[N, int],
-        assigned_target: N,
+        target_to_query: CanonicalNodeMapping[N],
+        masks: dict[CanonicalNode, int],
+        assigned_target: CanonicalNode,
         assigned_query_index: int,
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
         budget: _OperationBudget | None = None,
-    ) -> tuple[dict[N, int], dict[VariableClass, dict[V, V]], dict[VariableClass, set[V]]] | None:
+    ) -> tuple[dict[CanonicalNode, int], CanonicalVariableMapping[V], dict[VariableClass, set[V]]] | None:
         _spend(budget)
         assigned_bit = 1 << assigned_query_index
         next_masks = {target_node: (assigned_bit if target_node == assigned_target else mask & (query_data.all_nodes_mask ^ assigned_bit)) for target_node, mask in masks.items()}
@@ -1937,12 +2148,12 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         used_query_nodes: set[N],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
         budget: _OperationBudget | None = None,
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         if not self._partial_conditions_hold(stored, target_to_query, query_data):
             return None
 
@@ -1984,13 +2195,13 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         used_query_nodes: set[N],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
         match_limit: int,
         budget: _OperationBudget | None = None,
-    ) -> list[tuple[NodeMapping[N], VariableMapping[V]]]:
+    ) -> list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]]:
         if not self._partial_conditions_hold(stored, target_to_query, query_data):
             return []
 
@@ -2017,7 +2228,7 @@ class Database(Generic[N, L, V, I]):
             return []
 
         variable_state = self._copy_variable_state(target_var_to_query_identifier, used_query_identifiers)
-        results: list[tuple[NodeMapping[N], VariableMapping[V]]] = []
+        results: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]] = []
         self._search_single_graph_masks_collect(
             stored,
             query_data,
@@ -2035,8 +2246,8 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        masks: dict[N, int],
-    ) -> tuple[list[N], list[N], dict[N, int], list[list[int]]] | None:
+        masks: dict[CanonicalNode, int],
+    ) -> tuple[list[CanonicalNode], list[N], dict[CanonicalNode, int], list[list[int]]] | None:
         order = list(stored.order)
         query_nodes = list(query_data.graph.nodes)
         target_position = {node: position for position, node in enumerate(order)}
@@ -2053,7 +2264,7 @@ class Database(Generic[N, L, V, I]):
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
         budget: _OperationBudget | None = None,
-    ) -> tuple[list[N], list[N], dict[N, int], list[list[int]]] | None:
+    ) -> tuple[list[CanonicalNode], list[N], dict[CanonicalNode, int], list[list[int]]] | None:
         masks = self._initial_single_graph_masks(
             stored,
             query_data,
@@ -2081,10 +2292,10 @@ class Database(Generic[N, L, V, I]):
     def _fallback_anchor_targets(
         self,
         stored: _StoredGraph[N, L, V],
-        masks: dict[N, int],
-    ) -> tuple[N, ...]:
+        masks: dict[CanonicalNode, int],
+    ) -> tuple[CanonicalNode, ...]:
         product = 1
-        anchors: list[N] = []
+        anchors: list[CanonicalNode] = []
         for target_node in sorted(
             stored.order,
             key=lambda current_target: (
@@ -2109,7 +2320,7 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         try:
             budget = _OperationBudget(self._anchored_ops)
             masks = self._initial_single_graph_masks(
@@ -2156,14 +2367,14 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
-        masks: dict[N, int],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_to_query: CanonicalNodeMapping[N],
+        masks: dict[CanonicalNode, int],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
-        anchor_targets: tuple[N, ...],
+        anchor_targets: tuple[CanonicalNode, ...],
         anchor_index: int,
         budget: _OperationBudget,
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         _spend(budget)
 
         if anchor_index >= len(anchor_targets):
@@ -2249,7 +2460,7 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         if not self._z3_enabled or z3 is None:
             return None
 
@@ -2266,8 +2477,8 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        masks: dict[N, int],
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        masks: dict[CanonicalNode, int],
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         if not self._z3_enabled or z3 is None:
             return None
         solver_candidates = self._solver_candidates_from_masks(stored, query_data, masks)
@@ -2279,8 +2490,8 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        solver_candidates: tuple[list[N], list[N], dict[N, int], list[list[int]]],
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        solver_candidates: tuple[list[CanonicalNode], list[N], dict[CanonicalNode, int], list[list[int]]],
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         z3m: Any = z3
         order, query_nodes, target_position, candidates = solver_candidates
 
@@ -2323,7 +2534,7 @@ class Database(Generic[N, L, V, I]):
                         )
                     )
 
-        variables_by_class: dict[VariableClass, dict[V, list[int]]] = {}
+        variables_by_class: dict[VariableClass, dict[CanonicalVariable, list[int]]] = {}
         for target_index, target_node in enumerate(order):
             for variable_class, identifier in enumerate(stored.variables[target_node]):
                 variables_by_class.setdefault(variable_class, {}).setdefault(identifier, []).append(target_index)
@@ -2386,7 +2597,7 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         if not self._ortools_enabled or cp_model is None:
             return None
 
@@ -2403,8 +2614,8 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        masks: dict[N, int],
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        masks: dict[CanonicalNode, int],
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         if not self._ortools_enabled or cp_model is None:
             return None
         solver_candidates = self._solver_candidates_from_masks(stored, query_data, masks)
@@ -2416,8 +2627,8 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        solver_candidates: tuple[list[N], list[N], dict[N, int], list[list[int]]],
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+        solver_candidates: tuple[list[CanonicalNode], list[N], dict[CanonicalNode, int], list[list[int]]],
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         cp: Any = cp_model
         order, query_nodes, target_position, candidates = solver_candidates
 
@@ -2453,7 +2664,7 @@ class Database(Generic[N, L, V, I]):
                         ]
                     )
 
-        variables_by_class: dict[VariableClass, dict[V, list[int]]] = {}
+        variables_by_class: dict[VariableClass, dict[CanonicalVariable, list[int]]] = {}
         for target_index, target_node in enumerate(order):
             for variable_class, identifier in enumerate(stored.variables[target_node]):
                 variables_by_class.setdefault(variable_class, {}).setdefault(identifier, []).append(target_index)
@@ -2509,12 +2720,12 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
-        masks: dict[N, int],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_to_query: CanonicalNodeMapping[N],
+        masks: dict[CanonicalNode, int],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
         budget: _OperationBudget | None = None,
-    ) -> tuple[NodeMapping[N], VariableMapping[V]] | None:
+    ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         _spend(budget)
         if len(target_to_query) == len(stored.order):
             ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
@@ -2590,11 +2801,11 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-        target_to_query: dict[N, N],
-        masks: dict[N, int],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_to_query: CanonicalNodeMapping[N],
+        masks: dict[CanonicalNode, int],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
-        results: list[tuple[NodeMapping[N], VariableMapping[V]]],
+        results: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]],
         match_limit: int,
         budget: _OperationBudget | None = None,
     ) -> None:
@@ -2667,9 +2878,9 @@ class Database(Generic[N, L, V, I]):
     def _dynamic_label_candidates(
         self,
         stored: _StoredGraph[N, L, V],
-        target_node: N,
+        target_node: CanonicalNode,
         query_data: _QueryData[N, L, V],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> frozenset[N]:
         del used_query_identifiers
@@ -2686,10 +2897,10 @@ class Database(Generic[N, L, V, I]):
     def _dynamic_label_compatible(
         self,
         stored: _StoredGraph[N, L, V],
-        target_node: N,
+        target_node: CanonicalNode,
         query_node: N,
         query_data: _QueryData[N, L, V],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> bool:
         del used_query_identifiers
@@ -2708,11 +2919,11 @@ class Database(Generic[N, L, V, I]):
     def _dynamic_candidates_for_target(
         self,
         stored: _StoredGraph[N, L, V],
-        target_node: N,
-        target_to_query: dict[N, N],
+        target_node: CanonicalNode,
+        target_to_query: CanonicalNodeMapping[N],
         query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> list[N]:
         label_candidates = self._dynamic_label_candidates(
@@ -2762,13 +2973,13 @@ class Database(Generic[N, L, V, I]):
     def _dynamic_choice(
         self,
         stored: _StoredGraph[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
         use_lookahead: bool,
-    ) -> tuple[N | None, list[N]]:
+    ) -> tuple[CanonicalNode | None, list[N]]:
         unmatched_targets = [target_node for target_node in stored.order if target_node not in target_to_query]
         frontier_targets = [
             target_node
@@ -2780,7 +2991,7 @@ class Database(Generic[N, L, V, I]):
         ]
         candidate_targets = frontier_targets or unmatched_targets
 
-        best_target: N | None = None
+        best_target: CanonicalNode | None = None
         best_candidates: list[N] | None = None
         best_key: tuple[int, int, str] | None = None
 
@@ -2817,7 +3028,7 @@ class Database(Generic[N, L, V, I]):
                 target_to_query[best_target] = query_node
                 used_query_nodes.add(query_node)
 
-                added_mappings: list[tuple[VariableClass, V]] = []
+                added_mappings: list[tuple[VariableClass, CanonicalVariable]] = []
                 for variable_class, target_identifier in enumerate(stored.variables[best_target]):
                     query_identifier = query_data.variables[query_node][variable_class]
                     variable_mapping = target_var_to_query_identifier.setdefault(variable_class, {})
@@ -2851,10 +3062,10 @@ class Database(Generic[N, L, V, I]):
     def _complete_single_graph_dynamic(
         self,
         stored: _StoredGraph[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> bool:
         if len(target_to_query) == len(stored.order):
@@ -2876,7 +3087,7 @@ class Database(Generic[N, L, V, I]):
             target_to_query[best_target] = query_node
             used_query_nodes.add(query_node)
 
-            added_mappings: list[tuple[VariableClass, V]] = []
+            added_mappings: list[tuple[VariableClass, CanonicalVariable]] = []
             for variable_class, target_identifier in enumerate(stored.variables[best_target]):
                 query_identifier = query_data.variables[query_node][variable_class]
                 variable_mapping = target_var_to_query_identifier.setdefault(variable_class, {})
@@ -2907,12 +3118,12 @@ class Database(Generic[N, L, V, I]):
     def _enumerate_single_graph_dynamic(
         self,
         stored: _StoredGraph[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
-        results: list[tuple[NodeMapping[N], VariableMapping[V]]],
+        results: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]],
         match_limit: int,
         use_lookahead: bool,
     ) -> bool:
@@ -2941,7 +3152,7 @@ class Database(Generic[N, L, V, I]):
             target_to_query[best_target] = query_node
             used_query_nodes.add(query_node)
 
-            added_mappings: list[tuple[VariableClass, V]] = []
+            added_mappings: list[tuple[VariableClass, CanonicalVariable]] = []
             for variable_class, target_identifier in enumerate(stored.variables[best_target]):
                 query_identifier = query_data.variables[query_node][variable_class]
                 variable_mapping = target_var_to_query_identifier.setdefault(variable_class, {})
@@ -2977,10 +3188,10 @@ class Database(Generic[N, L, V, I]):
     def _dynamic_next_choice_key(
         self,
         stored: _StoredGraph[N, L, V],
-        target_to_query: dict[N, N],
+        target_to_query: CanonicalNodeMapping[N],
         query_data: _QueryData[N, L, V],
         used_query_nodes: set[N],
-        target_var_to_query_identifier: dict[VariableClass, dict[V, V]],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> tuple[float, float, str]:
         if len(target_to_query) == len(stored.order):
@@ -3364,8 +3575,8 @@ class Database(Generic[N, L, V, I]):
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
         matched_query_nodes: list[N],
-    ) -> VariableMapping[V]:
-        variable_mapping: defaultdict[VariableClass, dict[V, V]] = defaultdict(dict)
+    ) -> CanonicalVariableMapping[V]:
+        variable_mapping: defaultdict[VariableClass, dict[CanonicalVariable, V]] = defaultdict(dict)
 
         for target_node, query_node in zip(stored.order, matched_query_nodes, strict=True):
             if stored.labels[target_node] != query_data.labels[query_node]:
