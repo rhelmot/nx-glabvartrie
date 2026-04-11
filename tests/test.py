@@ -219,6 +219,34 @@ class TestUnits(unittest.TestCase):
         assert set(found_var_mapping[0]) == {0, 3}
         assert set(found_var_mapping[0].values()) == {152, 251}
 
+    def test_multiple_matches(self):
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+
+        target = nx.DiGraph()
+        target.add_node(1, label=None, vars=())
+        target.add_node(2, label=None, vars=())
+        target.add_node(3, label=None, vars=())
+        target.add_edge(1, 2)
+        target.add_edge(2, 3)
+
+        d.index(target, 0)
+
+        query = nx.DiGraph()
+        query.add_node(11, label=None, vars=())
+        query.add_node(12, label=None, vars=())
+        query.add_node(13, label=None, vars=())
+        query.add_node(14, label=None, vars=())
+        query.add_edge(11, 12)
+        query.add_edge(12, 13)
+        query.add_edge(13, 14)
+
+        result = list(d.query(query))
+
+        assert len(result) == 2
+        found_nodes = frozenset(frozenset(mapping.values()) for _, mapping, _, _ in result)
+        assert found_nodes == frozenset({frozenset({11,12,13}),frozenset({12,13,14})})
+
+
 FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
 FUZZ_OFFSET = int(os.environ.get("FUZZ_OFFSET", 0))
 
@@ -303,6 +331,8 @@ class TestFuzz(unittest.TestCase):
                         break
                 else:
                     assert False, "There is no corresponding finding for this target"
+
+            print("OK", i)
 
     def test_fuzz_many_small_sparse_query(self):
         def rcg(r: Random, n: int | None = None):

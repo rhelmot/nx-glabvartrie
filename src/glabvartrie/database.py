@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
+import math
 import os
 from typing import Any, Callable, Generic, Hashable, Iterator, TypeAlias, TypeVar
 
@@ -1026,11 +1027,18 @@ class Database(Generic[N, L, V, I]):
                 query_data,
                 remaining,
                 matches,
-                1,
+                self._all_match_limit(self._graphs[graph_index], query_data),
                 use_lookahead=True,
             )
 
         return matches
+
+    def _all_match_limit(
+        self,
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
+    ) -> int:
+        return math.perm(query_data.graph.number_of_nodes(), stored.graph.number_of_nodes())
 
     def _direct_graph_priority(
         self,
@@ -1515,7 +1523,6 @@ class Database(Generic[N, L, V, I]):
                             target_to_query,
                             self._variable_mapping(stored, query_data, matched_query_nodes),
                         )
-                        eligible.discard(graph_index)
 
                 remaining_active = set(next_active_graphs & eligible)
                 child_plans: list[tuple[int, int, _TrieNode, list[tuple[N, frozenset[int]]]]] = []
@@ -1579,21 +1586,22 @@ class Database(Generic[N, L, V, I]):
         }
         target_var_to_query_identifier, used_query_identifiers = self._variable_state(stored, target_to_query, query_data)
         try:
-            match = self._find_single_graph_match(
+            local_matches = self._enumerate_single_graph_matches(
                 stored,
                 query_data,
                 target_to_query,
                 used_query_nodes,
                 target_var_to_query_identifier,
                 used_query_identifiers,
+                self._all_match_limit(stored, query_data),
                 budget=self._native_budget(stored),
             )
         except _SearchTimeout:
-            match = self._timeout_fallback_match(stored, query_data)
-        if match is not None:
-            node_mapping, variable_mapping = match
-            self._append_match(matches, graph_index, node_mapping, variable_mapping)
-            eligible.discard(graph_index)
+            fallback_match = self._timeout_fallback_match(stored, query_data)
+            local_matches = [] if fallback_match is None else [fallback_match]
+        if local_matches:
+            for node_mapping, variable_mapping in local_matches:
+                self._append_match(matches, graph_index, node_mapping, variable_mapping)
             return True
 
         return False
