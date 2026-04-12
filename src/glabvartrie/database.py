@@ -1047,12 +1047,19 @@ class Database(Generic[N, L, V, I]):
                 seen_graphs,
                 self._native_ops * 4,
             )
+            unseen_graphs = eligible - seen_graphs
         if len(eligible) <= 4:
             yield from self._query_direct(query_data, eligible, seen_results)
             return
 
         used_query_nodes: set[N] = set()
         matched_query_nodes: list[N] = []
+
+        if unseen_graphs:
+            for child in sorted(self._root.children.values(), key=self._node_priority, reverse=True):
+                if child.descendant_graph_indices.isdisjoint(unseen_graphs):
+                    continue
+                yield from self._search(child, query_data, unseen_graphs, matched_query_nodes, used_query_nodes, seen_results)
 
         for child in sorted(self._root.children.values(), key=self._node_priority, reverse=True):
             if child.descendant_graph_indices.isdisjoint(eligible):
@@ -1659,6 +1666,7 @@ class Database(Generic[N, L, V, I]):
         used_query_nodes: set[N],
         seen_results: set[tuple[int, tuple[N, ...], I]],
         candidate_plan: list[tuple[N, frozenset[int]]] | None = None,
+        first_match_only: bool = False,
     ) -> Iterator[MatchResult[N, V, I]]:
         active_graphs = node.descendant_graph_indices & eligible
         if not active_graphs or node.topology_pattern is None:
@@ -1675,6 +1683,7 @@ class Database(Generic[N, L, V, I]):
                 used_query_nodes,
                 seen_results,
                 candidate_plan,
+                first_match_only,
             )
             return
 
@@ -1708,6 +1717,8 @@ class Database(Generic[N, L, V, I]):
                             self._variable_mapping(stored, query_data, matched_query_nodes),
                             seen_results,
                         )
+                        if first_match_only:
+                            eligible.discard(graph_index)
 
                 remaining_active = set(next_active_graphs & eligible)
                 child_plans: list[tuple[int, int, _TrieNode, list[tuple[N, frozenset[int]]]]] = []
@@ -1742,6 +1753,7 @@ class Database(Generic[N, L, V, I]):
                         used_query_nodes,
                         seen_results,
                         child_candidates,
+                        first_match_only,
                     )
 
             matched_query_nodes.pop()
@@ -1757,6 +1769,7 @@ class Database(Generic[N, L, V, I]):
         used_query_nodes: set[N],
         seen_results: set[tuple[int, tuple[N, ...], I]],
         candidate_plan: list[tuple[N, frozenset[int]]] | None = None,
+        first_match_only: bool = False,
     ) -> Iterator[MatchResult[N, V, I]]:
         del position
         del candidate_plan
@@ -1779,7 +1792,7 @@ class Database(Generic[N, L, V, I]):
                 used_query_nodes,
                 target_var_to_query_identifier,
                 used_query_identifiers,
-                self._all_match_limit(stored, query_data),
+                1 if first_match_only else self._all_match_limit(stored, query_data),
                 budget=self._native_budget(stored),
                 search_caches=None,
             ):
@@ -1789,6 +1802,9 @@ class Database(Generic[N, L, V, I]):
                     variable_mapping,
                     seen_results,
                 )
+                if first_match_only:
+                    eligible.discard(graph_index)
+                    return
         except _SearchTimeout:
             fallback_match = self._timeout_fallback_match(stored, query_data)
             if fallback_match is not None:
@@ -1798,6 +1814,8 @@ class Database(Generic[N, L, V, I]):
                     fallback_match[1],
                     seen_results,
                 )
+                if first_match_only:
+                    eligible.discard(graph_index)
 
     def _variable_state(
         self,
