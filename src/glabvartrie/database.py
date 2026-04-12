@@ -729,8 +729,10 @@ class Database(Generic[N, L, V, I]):
     def __init__(self, node_label: Callable[[dict[str, Any]], L], node_vars: Callable[[dict[str, Any]], Variables[V]]):
         self._node_label = node_label
         self._node_vars = node_vars
-        self._graphs: list[_StoredGraph[N, L, V]] = []
-        self._idents: list[dict[I, _IdentifierWitness[N, V]]] = []
+        self._graphs: dict[int, _StoredGraph[N, L, V]] = {}
+        self._idents: dict[int, dict[I, _IdentifierWitness[N, V]]] = {}
+        self._ident_to_graph_index: dict[I, int] = {}
+        self._next_graph_index = 0
         self._canonical_buckets: defaultdict[tuple[Any, ...], list[int]] = defaultdict(list)
         self._root = _TrieNode(depth=0, topology_pattern=None)
         self._heuristic_fallbacks_enabled = _env_enabled("GLABVARTRIE_ENABLE_HEURISTIC_FALLBACKS", True)
@@ -745,7 +747,7 @@ class Database(Generic[N, L, V, I]):
     def rename_identifiers(self, mapping: Mapping[I, I]) -> None:
         old_identifiers = {
             ident
-            for identifier_bucket in self._idents
+            for identifier_bucket in self._idents.values()
             for ident in identifier_bucket
         }
         renamed_identifiers = {
@@ -755,18 +757,94 @@ class Database(Generic[N, L, V, I]):
         if len(renamed_identifiers) != len(old_identifiers):
             raise ValueError("Identifier rename collision")
 
-        renamed_buckets: list[dict[I, _IdentifierWitness[N, V]]] = []
+        renamed_buckets: dict[int, dict[I, _IdentifierWitness[N, V]]] = {}
 
-        for identifier_bucket in self._idents:
+        for graph_index, identifier_bucket in self._idents.items():
             renamed_bucket: dict[I, _IdentifierWitness[N, V]] = {}
             for old_ident, witness in identifier_bucket.items():
                 new_ident = mapping.get(old_ident, old_ident)
                 if new_ident in renamed_bucket:
                     raise ValueError(f"Identifier rename collision for {new_ident!r}")
                 renamed_bucket[new_ident] = witness
-            renamed_buckets.append(renamed_bucket)
+            renamed_buckets[graph_index] = renamed_bucket
 
         self._idents = renamed_buckets
+        self._ident_to_graph_index = {
+            ident: graph_index
+            for graph_index, identifier_bucket in self._idents.items()
+            for ident in identifier_bucket
+        }
+
+    def _prune_trie_path(self, stored: _StoredGraph[N, L, V], graph_index: int) -> None:
+        path: list[tuple[_TrieNode, _TrieNode, _TopologyPattern, int]] = []
+        node = self._root
+        if graph_index in node.descendant_graph_indices:
+            node.descendant_graph_indices.discard(graph_index)
+
+        for depth, topology_pattern in enumerate(stored.topology_patterns, start=1):
+            child = node.children.get(topology_pattern)
+            if child is None:
+                return
+            child.descendant_graph_indices.discard(graph_index)
+            label_pattern = stored.label_patterns[depth - 1]
+            label_graphs = child.label_pattern_graph_indices.get(label_pattern)
+            if label_graphs is not None:
+                label_graphs.discard(graph_index)
+                if not label_graphs:
+                    del child.label_pattern_graph_indices[label_pattern]
+            option = stored.condition_options[depth - 1]
+            path.append((node, child, topology_pattern, depth - 1))
+            node = child
+
+            if option not in {
+                self._graphs[remaining_graph_index].condition_options[depth - 1]
+                for remaining_graph_index in node.descendant_graph_indices
+            }:
+                node.condition_options.discard(option)
+
+        if graph_index in node.terminal_graph_indices:
+            node.terminal_graph_indices = [
+                terminal_graph_index
+                for terminal_graph_index in node.terminal_graph_indices
+                if terminal_graph_index != graph_index
+            ]
+            if node.terminal_graph_indices:
+                node.full_conditions = self._graphs[node.terminal_graph_indices[0]].full_conditions
+            else:
+                node.full_conditions = None
+
+        for parent, child, topology_pattern, _ in reversed(path):
+            if (
+                child.descendant_graph_indices
+                or child.terminal_graph_indices
+                or child.children
+                or child.label_pattern_graph_indices
+            ):
+                continue
+            del parent.children[topology_pattern]
+
+    def unindex(self, ident: I) -> None:
+        graph_index = self._ident_to_graph_index.pop(ident, None)
+        if graph_index is None:
+            return
+
+        identifier_bucket = self._idents[graph_index]
+        del identifier_bucket[ident]
+        if identifier_bucket:
+            return
+
+        stored = self._graphs.pop(graph_index)
+        del self._idents[graph_index]
+        bucket_key = self._canonical_bucket_key(stored)
+        bucket = self._canonical_buckets[bucket_key]
+        self._canonical_buckets[bucket_key] = [
+            bucket_graph_index
+            for bucket_graph_index in bucket
+            if bucket_graph_index != graph_index
+        ]
+        if not self._canonical_buckets[bucket_key]:
+            del self._canonical_buckets[bucket_key]
+        self._prune_trie_path(stored, graph_index)
 
     def _identifier_witness(
         self,
@@ -1037,10 +1115,13 @@ class Database(Generic[N, L, V, I]):
             )
             if equivalent_witness is not None:
                 self._idents[graph_index][ident] = equivalent_witness
+                self._ident_to_graph_index[ident] = graph_index
                 return
-        graph_index = len(self._graphs)
-        self._graphs.append(stored)
-        self._idents.append({ident: identifier_witness})
+        graph_index = self._next_graph_index
+        self._next_graph_index += 1
+        self._graphs[graph_index] = stored
+        self._idents[graph_index] = {ident: identifier_witness}
+        self._ident_to_graph_index[ident] = graph_index
         self._canonical_buckets[bucket_key].append(graph_index)
 
         node = self._root
@@ -1066,7 +1147,7 @@ class Database(Generic[N, L, V, I]):
 
         eligible = {
             index
-            for index, stored in enumerate(self._graphs)
+            for index, stored in self._graphs.items()
             if self._can_match(stored, query_data)
         }
         if not eligible:

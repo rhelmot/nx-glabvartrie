@@ -413,6 +413,43 @@ class TestUnits(unittest.TestCase):
         with self.assertRaises(ValueError):
             d.rename_identifiers({10: 11})
 
+    def test_unindex_identifier_from_equivalent_bucket(self):
+        d, first_target, _, query = self._two_identifier_database()
+
+        d.unindex(998)
+
+        result = list(d.query(query))
+
+        assert len(result) == 1
+        found_node_mapping, found_var_mapping, found_ident = result[0]
+        assert found_ident == 999
+        assert is_valid_match(first_target, 999, query, found_node_mapping, found_var_mapping, found_ident)
+
+    def test_unindex_last_identifier_removes_graph(self):
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+
+        target = nx.DiGraph()
+        target.add_node(0, label=1, vars=())
+        target.add_node(1, label=2, vars=())
+        target.add_edge(0, 1)
+        d.index(target, 123)
+
+        query = nx.DiGraph()
+        query.add_node(10, label=1, vars=())
+        query.add_node(11, label=2, vars=())
+        query.add_edge(10, 11)
+
+        assert list(d.query(query))
+
+        d.unindex(123)
+
+        assert list(d.query(query)) == []
+        assert not d._graphs
+        assert not d._idents
+        assert not d._canonical_buckets
+        assert not d._root.descendant_graph_indices
+        assert not d._root.children
+
     def test_multiple_matches(self):
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
 
