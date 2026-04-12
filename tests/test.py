@@ -680,6 +680,51 @@ class TestFuzz(unittest.TestCase):
 
             print("EXACT OK", i)
 
+    def test_fuzz_exact_big(self):
+        def rcg(r: Random, n: int | None = None):
+            if n is None:
+                n = r.randrange(2, 10)
+            return random_connected_graph(
+                r,
+                range(n),
+                range(r.randrange(1, 5)),
+                range(r.randrange(1, 8)),
+                r.random() * 0.4,
+                r.random() * 0.35,
+            )
+
+        for i in range(EXACT_FUZZ_OFFSET, EXACT_FUZZ_OFFSET + EXACT_FUZZ_COUNT):
+            r = Random(i)
+            d: Database[int, int, int, int] = Database(node_label=lambda attrs: attrs["label"], node_vars=lambda attrs: attrs["vars"])
+            indexed_graphs: dict[int, nx.DiGraph[int]] = {}
+
+            for ident in range(r.randrange(4, 9)):
+                graph = rcg(r)
+                indexed_graphs[ident] = graph
+                d.index(graph, ident)
+
+            targets = [rcg(r, r.randrange(2, 10)) for _ in range(r.randrange(1, 5))]
+            next_ident = len(indexed_graphs)
+            for target in targets:
+                indexed_graphs[next_ident] = target
+                d.index(target, next_ident)
+                next_ident += 1
+
+            needed_nodes = max(1, sum(len(t) for t in targets))
+            query = rcg(r, r.randrange(max(needed_nodes, 3), max(needed_nodes + 1, 10)))
+            available_nodes = list(query)
+            variables = list(range(1000))
+            r.shuffle(variables)
+            r.shuffle(available_nodes)
+            for target in targets:
+                if len(available_nodes) < len(target):
+                    assert False, "misdesigned testcase"
+                embed_graph(query, target, available_nodes, variables)
+
+            # we don't have a mechanism to check for exactness here...
+            # just check it completes
+            list(d.query(query))
+
 
 if __name__ == '__main__':
     unittest.main()
