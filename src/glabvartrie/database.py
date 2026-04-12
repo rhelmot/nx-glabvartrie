@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Mapping, Set as AbstractSet
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
 import math
@@ -632,9 +633,9 @@ class _QueryData(Generic[N, L, V]):
     constant_masks: dict[L, int]
     variable_identifier_nodes: dict[tuple[VariableClass, V], frozenset[N]]
     variable_identifier_masks: dict[tuple[VariableClass, V], int]
-    predecessors: dict[N, frozenset[N]]
+    predecessors: dict[N, AbstractSet[N]]
     predecessor_masks: tuple[int, ...]
-    successors: dict[N, frozenset[N]]
+    successors: dict[N, AbstractSet[N]]
     successor_masks: tuple[int, ...]
     constant_counts: Counter[L]
     variable_group_sizes: dict[VariableClass, tuple[int, ...]]
@@ -703,12 +704,12 @@ def _build_query_data(
             key: mask_for_nodes(nodes)
             for key, nodes in variable_identifier_nodes_mut.items()
         },
-        predecessors={node: frozenset(graph.pred[node]) for node in graph.nodes},
+        predecessors={node: graph.pred[node].keys() for node in graph.nodes},
         predecessor_masks=tuple(
             sum(1 << node_indices[predecessor] for predecessor in graph.pred[node])
             for node in index_to_node
         ),
-        successors={node: frozenset(graph.succ[node]) for node in graph.nodes},
+        successors={node: graph.succ[node].keys() for node in graph.nodes},
         successor_masks=tuple(
             sum(1 << node_indices[successor] for successor in graph.succ[node])
             for node in index_to_node
@@ -1029,7 +1030,23 @@ class Database(Generic[N, L, V, I]):
             yield
 
         seen_results: set[tuple[int, tuple[N, ...], I]] = set()
-        yield from self._query_direct_first_matches(query_data, eligible, seen_results)
+        seen_graphs: set[int] = set()
+        yield from self._query_direct_first_matches(
+            query_data,
+            eligible,
+            seen_results,
+            seen_graphs,
+            self._native_ops,
+        )
+        unseen_graphs = eligible - seen_graphs
+        if unseen_graphs:
+            yield from self._query_direct_first_matches(
+                query_data,
+                unseen_graphs,
+                seen_results,
+                seen_graphs,
+                self._native_ops * 4,
+            )
         if len(eligible) <= 4:
             yield from self._query_direct(query_data, eligible, seen_results)
             return
@@ -1047,6 +1064,8 @@ class Database(Generic[N, L, V, I]):
         query_data: _QueryData[N, L, V],
         eligible: set[int],
         seen_results: set[tuple[int, tuple[N, ...], I]],
+        seen_graphs: set[int],
+        first_match_budget_ops: int,
     ) -> Iterator[MatchResult[N, V, I]]:
         graph_order = sorted(
             eligible,
@@ -1064,6 +1083,8 @@ class Database(Generic[N, L, V, I]):
                 1,
                 use_lookahead=True,
                 allow_timeout_fallback=False,
+                first_match_budget_ops=first_match_budget_ops,
+                seen_graphs=seen_graphs,
             )
 
     def _query_direct(
@@ -1189,6 +1210,8 @@ class Database(Generic[N, L, V, I]):
         match_limit: int,
         use_lookahead: bool,
         allow_timeout_fallback: bool = True,
+        first_match_budget_ops: int | None = None,
+        seen_graphs: set[int] | None = None,
     ) -> Iterator[MatchResult[N, V, I]]:
         if graph_index not in eligible or match_limit <= 0:
             return
@@ -1215,6 +1238,7 @@ class Database(Generic[N, L, V, I]):
                         node_mapping,
                         variable_mapping,
                         seen_results,
+                        seen_graphs,
                     )
             except _SearchTimeout:
                 fallback_match = self._timeout_fallback_match(stored, query_data) if allow_timeout_fallback else None
@@ -1225,12 +1249,19 @@ class Database(Generic[N, L, V, I]):
                         fallback_match[0],
                         fallback_match[1],
                         seen_results,
+                        seen_graphs,
                     )
         else:
-            search_caches = _SearchCaches[N, V]()
+            search_caches = _SearchCaches[N, V]() if allow_timeout_fallback else None
             match: tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None
             try:
                 budget = self._native_budget(stored)
+                if first_match_budget_ops is not None and not allow_timeout_fallback:
+                    budget = _OperationBudget(first_match_budget_ops)
+                elif budget is None and not allow_timeout_fallback:
+                    # The first-match prepass should not let small but ambiguous graphs
+                    # monopolize the iterator before later eligible identifiers are tried.
+                    budget = _OperationBudget(self._native_ops)
                 match = self._find_single_graph_match(
                     stored,
                     query_data,
@@ -1240,6 +1271,7 @@ class Database(Generic[N, L, V, I]):
                     {},
                     budget=budget,
                     search_caches=search_caches,
+                    use_search_caches=allow_timeout_fallback,
                 )
             except _SearchTimeout:
                 match = self._timeout_fallback_match(stored, query_data) if allow_timeout_fallback else None
@@ -1250,6 +1282,7 @@ class Database(Generic[N, L, V, I]):
                     match[0],
                     match[1],
                     seen_results,
+                    seen_graphs,
                 )
 
         if emitted:
@@ -1296,6 +1329,7 @@ class Database(Generic[N, L, V, I]):
         node_mapping: CanonicalNodeMapping[N],
         variable_mapping: CanonicalVariableMapping[V],
         seen_results: set[tuple[int, tuple[N, ...], I]],
+        seen_graphs: set[int] | None = None,
     ) -> Iterator[MatchResult[N, V, I]]:
         stored = self._graphs[graph_index]
         ordered_query_nodes = tuple(node_mapping[target_node] for target_node in stored.order)
@@ -1305,6 +1339,8 @@ class Database(Generic[N, L, V, I]):
             if signature in seen_results:
                 continue
             seen_results.add(signature)
+            if seen_graphs is not None:
+                seen_graphs.add(graph_index)
 
             witness_node_mapping = {
                 witness.canonical_to_witness_nodes[target_node]: query_node
@@ -2384,11 +2420,12 @@ class Database(Generic[N, L, V, I]):
         used_query_identifiers: dict[VariableClass, set[V]],
         budget: _OperationBudget | None = None,
         search_caches: _SearchCaches[N, V] | None = None,
+        use_search_caches: bool = True,
     ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         if not self._partial_conditions_hold(stored, target_to_query, query_data):
             return None
 
-        active_search_caches = search_caches or _SearchCaches[N, V]()
+        active_search_caches = search_caches or (_SearchCaches[N, V]() if use_search_caches else None)
         _spend(budget)
         masks = self._initial_single_graph_masks(
             stored,
@@ -3658,8 +3695,8 @@ class Database(Generic[N, L, V, I]):
         anchor_position: int,
         matched_query_nodes: list[N],
         query_data: _QueryData[N, L, V],
-    ) -> frozenset[N]:
-        anchored: frozenset[N] | None = None
+    ) -> AbstractSet[N]:
+        anchored: AbstractSet[N] | None = None
 
         if anchor_position in topology_pattern.prev_to_new:
             anchored = query_data.successors[matched_query_nodes[anchor_position]]
