@@ -261,6 +261,34 @@ class TestRegressions(unittest.TestCase):
         assert is_valid_match(target, 999, query, found_node_mapping, found_var_mapping, found_ident)
 
 class TestUnits(unittest.TestCase):
+    def _two_identifier_database(self) -> tuple[Database[int, int, int, int], nx.DiGraph[int], nx.DiGraph[int], nx.DiGraph[int]]:
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+
+        first_target = nx.DiGraph()
+        first_target.add_node(1, label=3, vars=())
+        first_target.add_node(3, label=0, vars=())
+        first_target.add_node(2, label=32, vars=(0,))
+        first_target.add_node(0, label=5, vars=(3,))
+        first_target.add_edges_from([(1, 0), (1, 2), (1, 3)])
+        d.index(first_target, 999)
+
+        second_target = nx.DiGraph()
+        second_target.add_node(0, label=3, vars=())
+        second_target.add_node(1, label=0, vars=())
+        second_target.add_node(2, label=32, vars=(1,))
+        second_target.add_node(3, label=5, vars=(4,))
+        second_target.add_edges_from([(0, 1), (0, 2), (0, 3)])
+        d.index(second_target, 998)
+
+        query = nx.DiGraph()
+        query.add_node(100, label=3, vars=())
+        query.add_node(30, label=0, vars=())
+        query.add_node(20, label=32, vars=(152,))
+        query.add_node(10, label=5, vars=(251,))
+        query.add_edges_from([(100, 10), (100, 20), (100, 30)])
+
+        return d, first_target, second_target, query
+
     def test_scc_fallback(self):
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
 
@@ -312,30 +340,7 @@ class TestUnits(unittest.TestCase):
         assert is_valid_match(target, 999, query, found_node_mapping, found_var_mapping, found_ident)
 
     def test_multiple_identifiers(self):
-        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
-
-        first_target = nx.DiGraph()
-        first_target.add_node(1, label=3, vars=())
-        first_target.add_node(3, label=0, vars=())
-        first_target.add_node(2, label=32, vars=(0,))
-        first_target.add_node(0, label=5, vars=(3,))
-        first_target.add_edges_from([(1, 0), (1, 2), (1, 3)])
-        d.index(first_target, 999)
-
-        second_target = nx.DiGraph()
-        second_target.add_node(0, label=3, vars=())
-        second_target.add_node(1, label=0, vars=())
-        second_target.add_node(2, label=32, vars=(1,))
-        second_target.add_node(3, label=5, vars=(4,))
-        second_target.add_edges_from([(0, 1), (0, 2), (0, 3)])
-        d.index(second_target, 998)
-
-        query = nx.DiGraph()
-        query.add_node(100, label=3, vars=())
-        query.add_node(30, label=0, vars=())
-        query.add_node(20, label=32, vars=(152,))
-        query.add_node(10, label=5, vars=(251,))
-        query.add_edges_from([(100, 10), (100, 20), (100, 30)])
+        d, first_target, second_target, query = self._two_identifier_database()
 
         result = list(d.query(query))
 
@@ -349,6 +354,34 @@ class TestUnits(unittest.TestCase):
         assert set(first_vars) == {0}
         assert set(first_vars[0]) == {0, 3}
         assert set(first_vars[0].values()) == {152, 251}
+
+    def test_rename_identifiers(self):
+        d, _, _, query = self._two_identifier_database()
+
+        d.rename_identifiers({999: 1999, 998: 1998})
+
+        result = list(d.query(query))
+
+        assert {found_ident for _, _, found_ident in result} == {1998, 1999}
+        d, _, _, query = self._two_identifier_database()
+        with self.assertRaises(ValueError):
+            d.rename_identifiers({999: 1, 998: 1})
+        result = list(d.query(query))
+        assert {found_ident for _, _, found_ident in result} == {998, 999}
+
+    def test_rename_identifiers_rejects_global_collisions(self):
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+
+        first_target = nx.DiGraph()
+        first_target.add_node(0, label=1, vars=())
+        d.index(first_target, 10)
+
+        second_target = nx.DiGraph()
+        second_target.add_node(0, label=2, vars=())
+        d.index(second_target, 11)
+
+        with self.assertRaises(ValueError):
+            d.rename_identifiers({10: 11})
 
     def test_multiple_matches(self):
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])

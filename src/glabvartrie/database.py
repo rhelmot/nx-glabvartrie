@@ -742,6 +742,32 @@ class Database(Generic[N, L, V, I]):
         self._z3_rlimit = _env_int("GLABVARTRIE_Z3_RLIMIT", 5_000_000)
         self._ortools_deterministic_time = _env_float("GLABVARTRIE_ORTOOLS_DETERMINISTIC_TIME", 0.2)
 
+    def rename_identifiers(self, mapping: Mapping[I, I]) -> None:
+        old_identifiers = {
+            ident
+            for identifier_bucket in self._idents
+            for ident in identifier_bucket
+        }
+        renamed_identifiers = {
+            mapping.get(ident, ident)
+            for ident in old_identifiers
+        }
+        if len(renamed_identifiers) != len(old_identifiers):
+            raise ValueError("Identifier rename collision")
+
+        renamed_buckets: list[dict[I, _IdentifierWitness[N, V]]] = []
+
+        for identifier_bucket in self._idents:
+            renamed_bucket: dict[I, _IdentifierWitness[N, V]] = {}
+            for old_ident, witness in identifier_bucket.items():
+                new_ident = mapping.get(old_ident, old_ident)
+                if new_ident in renamed_bucket:
+                    raise ValueError(f"Identifier rename collision for {new_ident!r}")
+                renamed_bucket[new_ident] = witness
+            renamed_buckets.append(renamed_bucket)
+
+        self._idents = renamed_buckets
+
     def _identifier_witness(
         self,
         canonical_to_witness_nodes: dict[CanonicalNode, N],
