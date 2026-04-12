@@ -951,19 +951,20 @@ class Database(Generic[N, L, V, I]):
             weisfeiler_lehman_graph_hash(equivalence_graph, node_attr="canon_label"),
         )
 
-    def _stored_graphs_equivalent(
+    def _equivalent_identifier_witness(
         self,
         left: _StoredGraph[N, L, V],
         right: _StoredGraph[N, L, V],
-    ) -> bool:
+        right_witness: _IdentifierWitness[N, V],
+    ) -> _IdentifierWitness[N, V] | None:
         if left.graph.number_of_nodes() != right.graph.number_of_nodes():
-            return False
+            return None
         if left.graph.number_of_edges() != right.graph.number_of_edges():
-            return False
+            return None
         if left.constant_counts != right.constant_counts:
-            return False
+            return None
         if left.variable_group_sizes != right.variable_group_sizes:
-            return False
+            return None
 
         left_graph = self._equivalence_graph(left)
         right_graph = self._equivalence_graph(right)
@@ -995,9 +996,21 @@ class Database(Generic[N, L, V, I]):
                     continue
                 break
             else:
-                return True
+                return self._identifier_witness(
+                    {
+                        left_node: right_witness.canonical_to_witness_nodes[right_node]
+                        for left_node, right_node in mapping.items()
+                    },
+                    {
+                        variable_class: {
+                            left_identifier: right_witness.canonical_to_witness_variables[variable_class][right_identifier]
+                            for left_identifier, right_identifier in identifier_mapping.items()
+                        }
+                        for variable_class, identifier_mapping in slot_mapping.items()
+                    },
+                )
 
-        return False
+        return None
 
     def index(self, g: nx.DiGraph[N], ident: I) -> None:
         labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
@@ -1017,8 +1030,13 @@ class Database(Generic[N, L, V, I]):
         )
         bucket_key = self._canonical_bucket_key(stored)
         for graph_index in self._canonical_buckets[bucket_key]:
-            if self._stored_graphs_equivalent(self._graphs[graph_index], stored):
-                self._idents[graph_index][ident] = identifier_witness
+            equivalent_witness = self._equivalent_identifier_witness(
+                self._graphs[graph_index],
+                stored,
+                identifier_witness,
+            )
+            if equivalent_witness is not None:
+                self._idents[graph_index][ident] = equivalent_witness
                 return
         graph_index = len(self._graphs)
         self._graphs.append(stored)

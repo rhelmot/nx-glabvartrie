@@ -260,6 +260,36 @@ class TestRegressions(unittest.TestCase):
         found_node_mapping, found_var_mapping, found_ident = result[0]
         assert is_valid_match(target, 999, query, found_node_mapping, found_var_mapping, found_ident)
 
+    def test_equivalent_identifier_witness_translation(self):
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+
+        first_target = nx.DiGraph()
+        first_target.add_node(0, label=1, vars=())
+        first_target.add_node(1, label=0, vars=())
+        first_target.add_edge(0, 1)
+        d.index(first_target, 2)
+
+        second_target = nx.DiGraph()
+        second_target.add_node(0, label=0, vars=())
+        second_target.add_node(1, label=1, vars=())
+        second_target.add_edge(1, 0)
+        d.index(second_target, 7)
+
+        query = nx.DiGraph()
+        query.add_node(0, label=1, vars=())
+        query.add_node(1, label=0, vars=())
+        query.add_node(2, label=0, vars=())
+        query.add_edge(0, 2)
+        query.add_edge(2, 0)
+        query.add_edge(2, 1)
+        query.add_edge(2, 2)
+
+        result = list(d.query(query))
+        by_ident = {found_ident: (found_node_mapping, found_var_mapping) for found_node_mapping, found_var_mapping, found_ident in result}
+
+        assert is_valid_match(first_target, 2, query, by_ident[2][0], by_ident[2][1], 2)
+        assert is_valid_match(second_target, 7, query, by_ident[7][0], by_ident[7][1], 7)
+
 class TestUnits(unittest.TestCase):
     def _two_identifier_database(self) -> tuple[Database[int, int, int, int], nx.DiGraph[int], nx.DiGraph[int], nx.DiGraph[int]]:
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
@@ -413,7 +443,7 @@ class TestUnits(unittest.TestCase):
 
 FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
 FUZZ_OFFSET = int(os.environ.get("FUZZ_OFFSET", 0))
-EXACT_FUZZ_COUNT = int(os.environ.get("EXACT_FUZZ_COUNT", 20))
+EXACT_FUZZ_COUNT = int(os.environ.get("EXACT_FUZZ_COUNT", 100))
 EXACT_FUZZ_OFFSET = int(os.environ.get("EXACT_FUZZ_OFFSET", 0))
 
 class TestFuzz(unittest.TestCase):
