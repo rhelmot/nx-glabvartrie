@@ -114,6 +114,127 @@ def embed_graph(query: nx.DiGraph[int], t: nx.DiGraph[int], available_nodes: lis
         )
 
 
+def normalize_match_result(
+    node_mapping: Mapping[int, int],
+    variable_mapping: Mapping[int, Mapping[int, int]],
+    ident: int,
+) -> tuple[
+    int,
+    tuple[tuple[int, int], ...],
+    tuple[tuple[int, tuple[tuple[int, int], ...]], ...],
+]:
+    return (
+        ident,
+        tuple(sorted(node_mapping.items())),
+        tuple(
+            (variable_class, tuple(sorted(identifier_mapping.items())))
+            for variable_class, identifier_mapping in sorted(variable_mapping.items())
+        ),
+    )
+
+
+def normalize_subgraph_result(
+    node_mapping: Mapping[int, int],
+    ident: int,
+) -> tuple[int, frozenset[int]]:
+    return ident, frozenset(node_mapping.values())
+
+
+def brute_force_matches(
+    target_graph: nx.DiGraph[int],
+    target_ident: int,
+    query_graph: nx.DiGraph[int],
+) -> set[
+    tuple[
+        int,
+        tuple[tuple[int, int], ...],
+        tuple[tuple[int, tuple[tuple[int, int], ...]], ...],
+    ]
+]:
+    target_nodes = list(target_graph.nodes)
+    candidate_nodes = {
+        target_node: [
+            query_node
+            for query_node in query_graph.nodes
+            if target_graph.nodes[target_node]["label"] == query_graph.nodes[query_node]["label"]
+            and len(target_graph.nodes[target_node]["vars"]) == len(query_graph.nodes[query_node]["vars"])
+        ]
+        for target_node in target_nodes
+    }
+    order = sorted(
+        target_nodes,
+        key=lambda target_node: (
+            len(candidate_nodes[target_node]),
+            -target_graph.in_degree(target_node) - target_graph.out_degree(target_node),
+            target_node,
+        ),
+    )
+    results: set[
+        tuple[
+            int,
+            tuple[tuple[int, int], ...],
+            tuple[tuple[int, tuple[tuple[int, int], ...]], ...],
+        ]
+    ] = set()
+
+    def visit(
+        depth: int,
+        node_mapping: dict[int, int],
+        used_query_nodes: set[int],
+        variable_mapping: dict[int, dict[int, int]],
+    ) -> None:
+        if depth == len(order):
+            for source, target in target_graph.edges:
+                if not query_graph.has_edge(node_mapping[source], node_mapping[target]):
+                    return
+            results.add(normalize_match_result(node_mapping, variable_mapping, target_ident))
+            return
+
+        target_node = order[depth]
+        for query_node in candidate_nodes[target_node]:
+            if query_node in used_query_nodes:
+                continue
+
+            valid = True
+            for predecessor in target_graph.pred[target_node]:
+                if predecessor in node_mapping and not query_graph.has_edge(node_mapping[predecessor], query_node):
+                    valid = False
+                    break
+            if not valid:
+                continue
+            for successor in target_graph.succ[target_node]:
+                if successor in node_mapping and not query_graph.has_edge(query_node, node_mapping[successor]):
+                    valid = False
+                    break
+            if not valid:
+                continue
+
+            next_variable_mapping = {
+                variable_class: dict(identifier_mapping)
+                for variable_class, identifier_mapping in variable_mapping.items()
+            }
+            target_vars = target_graph.nodes[target_node]["vars"]
+            query_vars = query_graph.nodes[query_node]["vars"]
+            for variable_class, target_identifier in enumerate(target_vars):
+                query_identifier = query_vars[variable_class]
+                existing = next_variable_mapping.setdefault(variable_class, {}).get(target_identifier)
+                if existing is not None and existing != query_identifier:
+                    valid = False
+                    break
+                next_variable_mapping[variable_class][target_identifier] = query_identifier
+            if not valid:
+                continue
+
+            node_mapping[target_node] = query_node
+            used_query_nodes.add(query_node)
+            visit(depth + 1, node_mapping, used_query_nodes, next_variable_mapping)
+            used_query_nodes.remove(query_node)
+            del node_mapping[target_node]
+
+    visit(0, {}, set(), {})
+    return results
+
+
 class TestRegressions(unittest.TestCase):
     def test_label_aware_symmetry_conditions(self):
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
@@ -133,13 +254,63 @@ class TestRegressions(unittest.TestCase):
         query.add_node(10, label=5, vars=(251,))
         query.add_edges_from([(100, 10), (100, 20), (100, 30)])
 
-        result = list(d.query(query))
+        result = list(d.query_best_effort(query))
 
         assert len(result) == 1
         found_node_mapping, found_var_mapping, found_ident = result[0]
         assert is_valid_match(target, 999, query, found_node_mapping, found_var_mapping, found_ident)
 
 class TestUnits(unittest.TestCase):
+    def test_scc_fallback(self):
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+
+        target = nx.DiGraph()
+        next_node = 0
+        previous_exit = None
+        for component in range(20):
+            cycle_nodes = [next_node, next_node + 1, next_node + 2]
+            next_node += 3
+            for offset, node in enumerate(cycle_nodes):
+                target.add_node(node, label=component * 10 + offset, vars=())
+            target.add_edge(cycle_nodes[0], cycle_nodes[1])
+            target.add_edge(cycle_nodes[1], cycle_nodes[2])
+            target.add_edge(cycle_nodes[2], cycle_nodes[0])
+            if previous_exit is not None:
+                target.add_edge(previous_exit, cycle_nodes[0])
+            previous_exit = cycle_nodes[2]
+
+        query = nx.DiGraph()
+        for node, attrs in target.nodes(data=True):
+            query.add_node(node + 1000, **attrs)
+        for source, target_node in target.edges:
+            query.add_edge(source + 1000, target_node + 1000)
+        for distractor in range(200):
+            query.add_node(distractor, label=10_000 + distractor, vars=())
+        for distractor in range(199):
+            query.add_edge(distractor, distractor + 1)
+
+        d.index(target, 999)
+        d._native_ops = 1
+        d._ortools_enabled = False
+        d._z3_enabled = False
+
+        scc_calls = 0
+        original_scc = d._find_single_graph_match_scc_decomposed
+
+        def wrapped_scc(*args, **kwargs):
+            nonlocal scc_calls
+            scc_calls += 1
+            return original_scc(*args, **kwargs)
+
+        d._find_single_graph_match_scc_decomposed = wrapped_scc
+
+        result = list(d.query_best_effort(query))
+
+        assert scc_calls == 1
+        assert len(result) == 1
+        found_node_mapping, found_var_mapping, found_ident = result[0]
+        assert is_valid_match(target, 999, query, found_node_mapping, found_var_mapping, found_ident)
+
     def test_multiple_identifiers(self):
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
 
@@ -209,6 +380,8 @@ class TestUnits(unittest.TestCase):
 
 FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
 FUZZ_OFFSET = int(os.environ.get("FUZZ_OFFSET", 0))
+EXACT_FUZZ_COUNT = int(os.environ.get("EXACT_FUZZ_COUNT", 20))
+EXACT_FUZZ_OFFSET = int(os.environ.get("EXACT_FUZZ_OFFSET", 0))
 
 class TestFuzz(unittest.TestCase):
     def test_fuzz(self):
@@ -240,7 +413,7 @@ class TestFuzz(unittest.TestCase):
                 target_ident + 100: target_graph
                 for target_ident, target_graph in enumerate(targets)
             }
-            for found_node_mapping, found_var_mapping, found_ident in d.query(query):
+            for found_node_mapping, found_var_mapping, found_ident in d.query_best_effort(query):
                 target_graph = remaining_target_graphs.get(found_ident)
                 if target_graph is None:
                     continue
@@ -296,7 +469,7 @@ class TestFuzz(unittest.TestCase):
                 target_ident + 100: target_graph
                 for target_ident, target_graph in enumerate(targets)
             }
-            for found_node_mapping, found_var_mapping, found_ident in d.query(query):
+            for found_node_mapping, found_var_mapping, found_ident in d.query_best_effort(query):
                 target_graph = remaining_target_graphs.get(found_ident)
                 if target_graph is None:
                     continue
@@ -359,7 +532,7 @@ class TestFuzz(unittest.TestCase):
                 target_ident + 2000: target_graph
                 for target_ident, target_graph in enumerate(targets)
             }
-            for found_node_mapping, found_var_mapping, found_ident in d.query(query):
+            for found_node_mapping, found_var_mapping, found_ident in d.query_best_effort(query):
                 target_graph = remaining_target_graphs.get(found_ident)
                 if target_graph is None:
                     continue
@@ -378,6 +551,71 @@ class TestFuzz(unittest.TestCase):
             assert not remaining_target_graphs, "There is no corresponding finding for this target"
 
             print("OK", i)
+
+    def test_fuzz_exact_small(self):
+        def rcg(r: Random, n: int | None = None):
+            if n is None:
+                n = r.randrange(2, 6)
+            return random_connected_graph(
+                r,
+                range(n),
+                range(r.randrange(1, 5)),
+                range(r.randrange(1, 8)),
+                r.random() * 0.4,
+                r.random() * 0.35,
+            )
+
+        for i in range(EXACT_FUZZ_OFFSET, EXACT_FUZZ_OFFSET + EXACT_FUZZ_COUNT):
+            r = Random(i)
+            d: Database[int, int, int, int] = Database(node_label=lambda attrs: attrs["label"], node_vars=lambda attrs: attrs["vars"])
+            indexed_graphs: dict[int, nx.DiGraph[int]] = {}
+
+            for ident in range(r.randrange(4, 9)):
+                graph = rcg(r)
+                indexed_graphs[ident] = graph
+                d.index(graph, ident)
+
+            targets = [rcg(r, r.randrange(2, 5)) for _ in range(r.randrange(1, 3))]
+            next_ident = len(indexed_graphs)
+            for target in targets:
+                indexed_graphs[next_ident] = target
+                d.index(target, next_ident)
+                next_ident += 1
+
+            needed_nodes = max(1, sum(len(t) for t in targets))
+            query = rcg(r, r.randrange(max(needed_nodes, 3), max(needed_nodes + 1, 8)))
+            available_nodes = list(query)
+            variables = list(range(1000))
+            r.shuffle(variables)
+            r.shuffle(available_nodes)
+            for target in targets:
+                if len(available_nodes) < len(target):
+                    break
+                embed_graph(query, target, available_nodes, variables)
+
+            actual_results = list(d.query(query))
+            actual_subgraphs = set()
+            for found_node_mapping, found_var_mapping, found_ident in actual_results:
+                assert is_valid_match(
+                    indexed_graphs[found_ident],
+                    found_ident,
+                    query,
+                    found_node_mapping,
+                    found_var_mapping,
+                    found_ident,
+                )
+                actual_subgraphs.add(normalize_subgraph_result(found_node_mapping, found_ident))
+
+            expected_subgraphs = {
+                normalize_subgraph_result(dict(node_mapping), ident)
+                for ident, target_graph in indexed_graphs.items()
+                for _, node_mapping, _ in brute_force_matches(target_graph, ident, query)
+            }
+
+            assert len(actual_results) == len(actual_subgraphs)
+            assert actual_subgraphs == expected_subgraphs
+
+            print("EXACT OK", i)
 
 
 if __name__ == '__main__':
