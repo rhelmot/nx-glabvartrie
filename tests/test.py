@@ -477,6 +477,46 @@ class TestUnits(unittest.TestCase):
         found_nodes = frozenset(frozenset(mapping.values()) for mapping, _, _ in result)
         assert found_nodes == frozenset({frozenset({11,12,13}),frozenset({12,13,14})})
 
+    def test_unsortable_nodes_with_node_order_key(self):
+        class Node:
+            def __init__(self, key: int):
+                self.key = key
+
+            def __hash__(self) -> int:
+                return hash(self.key)
+
+            def __eq__(self, other: object) -> bool:
+                return isinstance(other, Node) and self.key == other.key
+
+        d: Database[Node, int, int, int] = Database(
+            node_label=lambda attrs: attrs['label'],
+            node_vars=lambda attrs: attrs['vars'],
+            node_order_key=lambda node: node.key,
+        )
+
+        source = Node(1)
+        target = Node(2)
+        indexed = nx.DiGraph()
+        indexed.add_node(source, label=1, vars=())
+        indexed.add_node(target, label=2, vars=())
+        indexed.add_edge(source, target)
+        d.index(indexed, 10)
+
+        query_source = Node(10)
+        query_target = Node(20)
+        query = nx.DiGraph()
+        query.add_node(query_source, label=1, vars=())
+        query.add_node(query_target, label=2, vars=())
+        query.add_edge(query_source, query_target)
+
+        result = list(d.query(query))
+
+        assert len(result) == 1
+        found_node_mapping, found_var_mapping, found_ident = result[0]
+        assert found_ident == 10
+        assert found_var_mapping == {}
+        assert found_node_mapping == {source: query_source, target: query_target}
+
 
 FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
 FUZZ_OFFSET = int(os.environ.get("FUZZ_OFFSET", 0))

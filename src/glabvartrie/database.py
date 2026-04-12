@@ -39,6 +39,10 @@ MatchSignature: TypeAlias = Hashable
 InternalMatchSignature: TypeAlias = tuple[int, tuple[Any, ...]]
 
 
+def _default_node_order_key(node: Hashable) -> Any:
+    return node
+
+
 def _env_enabled(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -670,6 +674,7 @@ def _build_query_data(
     graph: nx.DiGraph[N],
     labels: dict[N, L],
     variables: dict[N, Variables[V]],
+    node_order_key: Callable[[N], Any],
 ) -> _QueryData[N, L, V]:
     constant_nodes_mut: defaultdict[L, set[N]] = defaultdict(set)
     variable_identifier_nodes_mut: defaultdict[tuple[VariableClass, V], set[N]] = defaultdict(set)
@@ -718,7 +723,7 @@ def _build_query_data(
         variable_group_sizes=variable_group_sizes,
         in_degrees=dict(graph.in_degree()),
         out_degrees=dict(graph.out_degree()),
-        node_ranks={node: rank for rank, node in enumerate(sorted(graph.nodes, key=repr))},
+        node_ranks={node: rank for rank, node in enumerate(sorted(graph.nodes, key=node_order_key))},
         node_indices=node_indices,
         index_to_node=index_to_node,
         all_nodes_mask=all_nodes_mask,
@@ -726,9 +731,15 @@ def _build_query_data(
 
 
 class Database(Generic[N, L, V, I]):
-    def __init__(self, node_label: Callable[[dict[str, Any]], L], node_vars: Callable[[dict[str, Any]], Variables[V]]):
+    def __init__(
+        self,
+        node_label: Callable[[dict[str, Any]], L],
+        node_vars: Callable[[dict[str, Any]], Variables[V]],
+        node_order_key: Callable[[N], Any] | None = None,
+    ):
         self._node_label = node_label
         self._node_vars = node_vars
+        self._node_order_key = node_order_key or _default_node_order_key  # type: ignore[assignment]
         self._graphs: dict[int, _StoredGraph[N, L, V]] = {}
         self._idents: dict[int, dict[I, _IdentifierWitness[N, V]]] = {}
         self._ident_to_graph_index: dict[I, int] = {}
@@ -1143,7 +1154,7 @@ class Database(Generic[N, L, V, I]):
     def query(self, g: nx.DiGraph[N], *, best_effort: bool = False) -> Iterator[MatchResult[N, V, I]]:
         query_labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
         query_variables = {node: self._node_vars(g.nodes[node]) for node in g.nodes}
-        query_data = _build_query_data(g, query_labels, query_variables)
+        query_data = _build_query_data(g, query_labels, query_variables, self._node_order_key)
 
         eligible = {
             index
@@ -1360,7 +1371,7 @@ class Database(Generic[N, L, V, I]):
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
-    ) -> tuple[int, int, str]:
+    ) -> tuple[int, int, int]:
         root_target = min(
             stored.order,
             key=lambda target_node: (
@@ -1374,13 +1385,13 @@ class Database(Generic[N, L, V, I]):
                     )
                 ),
                 -(stored.in_degrees[target_node] + stored.out_degrees[target_node]),
-                repr(target_node),
+                target_node,
             ),
         )
         return (
             len(self._dynamic_label_candidates(stored, root_target, query_data, {}, {})),
             -(stored.in_degrees[root_target] + stored.out_degrees[root_target]),
-            repr(root_target),
+            root_target,
         )
 
     def _collect_single_graph_matches(
@@ -1626,7 +1637,7 @@ class Database(Generic[N, L, V, I]):
             set[N],
             CanonicalVariableMapping[V],
             dict[VariableClass, set[V]],
-            tuple[int, int, int, str],
+            tuple[int, int, int, int],
         ] | None:
             component_nodes = sccs[component_id]
             boundary_nodes = {
@@ -1678,11 +1689,11 @@ class Database(Generic[N, L, V, I]):
                         -len(component_nodes),
                         refined[target_node].bit_count(),
                         -(substored.in_degrees[target_node] + substored.out_degrees[target_node]),
-                        repr(target_node),
+                        target_node,
                     )
                     for target_node in component_nodes
                 ),
-                default=(0, 0, 0, ""),
+                default=(0, 0, 0, 0),
             )
             return (
                 substored,
@@ -1705,7 +1716,7 @@ class Database(Generic[N, L, V, I]):
                     return None
                 return target_to_query, self._variable_mapping(stored, query_data, ordered_query_nodes)
 
-            setups: list[tuple[int, _StoredGraph[N, L, V], tuple[CanonicalNode, ...], CanonicalNodeMapping[N], set[N], CanonicalVariableMapping[V], dict[VariableClass, set[V]], tuple[int, int, int, str]]] = []
+            setups: list[tuple[int, _StoredGraph[N, L, V], tuple[CanonicalNode, ...], CanonicalNodeMapping[N], set[N], CanonicalVariableMapping[V], dict[VariableClass, set[V]], tuple[int, int, int, int]]] = []
             for component_id in condensation.nodes:
                 if component_id in assigned_components:
                     continue
@@ -2186,7 +2197,7 @@ class Database(Generic[N, L, V, I]):
         query_node: N,
         domains: dict[CanonicalNode, frozenset[N]],
         query_data: _QueryData[N, L, V],
-    ) -> tuple[int, int, str]:
+    ) -> tuple[int, int, Any]:
         impact = 0
         for successor in stored.successors[target_node]:
             if successor in domains and len(domains[successor]) > 1:
@@ -2197,7 +2208,7 @@ class Database(Generic[N, L, V, I]):
         return (
             impact,
             -(query_data.in_degrees[query_node] + query_data.out_degrees[query_node]),
-            repr(query_node),
+            self._node_order_key(query_node),
         )
 
     def _propagate_assignment_domains(
@@ -2472,7 +2483,7 @@ class Database(Generic[N, L, V, I]):
         query_index: int,
         masks: dict[CanonicalNode, int],
         query_data: _QueryData[N, L, V],
-    ) -> tuple[int, int, str]:
+    ) -> tuple[int, int, Any]:
         impact = 0
         successor_mask = query_data.successor_masks[query_index]
         predecessor_mask = query_data.predecessor_masks[query_index]
@@ -2486,7 +2497,7 @@ class Database(Generic[N, L, V, I]):
         return (
             impact,
             -(query_data.in_degrees[query_node] + query_data.out_degrees[query_node]),
-            repr(query_node),
+            self._node_order_key(query_node),
         )
 
     def _propagate_assignment_masks(
@@ -2802,7 +2813,7 @@ class Database(Generic[N, L, V, I]):
             key=lambda current_target: (
                 masks[current_target].bit_count(),
                 -(stored.in_degrees[current_target] + stored.out_degrees[current_target]),
-                repr(current_target),
+                current_target,
             ),
         ):
             domain_size = masks[target_node].bit_count()
@@ -3259,7 +3270,7 @@ class Database(Generic[N, L, V, I]):
             key=lambda current_target: (
                 masks[current_target].bit_count(),
                 -(stored.in_degrees[current_target] + stored.out_degrees[current_target]),
-                repr(current_target),
+                current_target,
             ),
         )
 
@@ -3346,7 +3357,7 @@ class Database(Generic[N, L, V, I]):
             key=lambda current_target: (
                 masks[current_target].bit_count(),
                 -(stored.in_degrees[current_target] + stored.out_degrees[current_target]),
-                repr(current_target),
+                current_target,
             ),
         )
 
@@ -3489,7 +3500,7 @@ class Database(Generic[N, L, V, I]):
                 continue
             accepted.append(query_node)
 
-        accepted.sort(key=lambda node: repr(node))
+        accepted.sort(key=self._node_order_key)
         return accepted
 
     def _dynamic_choice(
@@ -3515,7 +3526,7 @@ class Database(Generic[N, L, V, I]):
 
         best_target: CanonicalNode | None = None
         best_candidates: list[N] | None = None
-        best_key: tuple[int, int, str] | None = None
+        best_key: tuple[int, int, int] | None = None
 
         for target_node in candidate_targets:
             candidates = self._dynamic_candidates_for_target(
@@ -3533,7 +3544,7 @@ class Database(Generic[N, L, V, I]):
             key = (
                 len(candidates),
                 -(stored.in_degrees[target_node] + stored.out_degrees[target_node]),
-                repr(target_node),
+                target_node,
             )
             if best_key is None or key < best_key:
                 best_key = key
@@ -3545,7 +3556,7 @@ class Database(Generic[N, L, V, I]):
 
         ordered_candidates = best_candidates
         if use_lookahead and 1 < len(best_candidates) <= 16:
-            candidate_scores: list[tuple[tuple[float, float, str], N]] = []
+            candidate_scores: list[tuple[tuple[float, float, int], N]] = []
             for query_node in best_candidates:
                 target_to_query[best_target] = query_node
                 used_query_nodes.add(query_node)
@@ -3576,7 +3587,7 @@ class Database(Generic[N, L, V, I]):
                 used_query_nodes.remove(query_node)
                 del target_to_query[best_target]
 
-            candidate_scores.sort(key=lambda item: (item[0], repr(item[1])))
+            candidate_scores.sort(key=lambda item: (item[0], self._node_order_key(item[1])))
             ordered_candidates = [query_node for _, query_node in candidate_scores]
 
         return best_target, ordered_candidates
@@ -3715,9 +3726,9 @@ class Database(Generic[N, L, V, I]):
         used_query_nodes: set[N],
         target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
-    ) -> tuple[float, float, str]:
+    ) -> tuple[float, float, int]:
         if len(target_to_query) == len(stored.order):
-            return (-1.0, 0.0, "")
+            return (-1.0, 0.0, -1)
 
         unmatched_targets = [target_node for target_node in stored.order if target_node not in target_to_query]
         frontier_targets = [
@@ -3730,7 +3741,7 @@ class Database(Generic[N, L, V, I]):
         ]
         candidate_targets = frontier_targets or unmatched_targets
 
-        best_key: tuple[float, float, str] | None = None
+        best_key: tuple[float, float, int] | None = None
         for target_node in candidate_targets:
             candidates = self._dynamic_candidates_for_target(
                 stored,
@@ -3742,17 +3753,17 @@ class Database(Generic[N, L, V, I]):
                 used_query_identifiers,
             )
             if not candidates:
-                return (float("inf"), float("inf"), repr(target_node))
+                return (float("inf"), float("inf"), target_node)
 
             key = (
                 float(len(candidates)),
                 float(-(stored.in_degrees[target_node] + stored.out_degrees[target_node])),
-                repr(target_node),
+                target_node,
             )
             if best_key is None or key < best_key:
                 best_key = key
 
-        return best_key or (-1.0, 0.0, "")
+        return best_key or (-1.0, 0.0, -1)
 
     def _single_graph_candidates(
         self,
@@ -3811,7 +3822,7 @@ class Database(Generic[N, L, V, I]):
                 continue
             accepted.append((candidate, frozenset({graph_index})))
 
-        accepted.sort(key=lambda item: repr(item[0]))
+        accepted.sort(key=lambda item: self._node_order_key(item[0]))
         return accepted
 
     def _candidate_nodes(
@@ -3888,7 +3899,7 @@ class Database(Generic[N, L, V, I]):
                 continue
             accepted.append((candidate, matching_graphs))
 
-        accepted.sort(key=lambda item: (-len(item[1]), repr(item[0])))
+        accepted.sort(key=lambda item: (-len(item[1]), self._node_order_key(item[0])))
         return accepted
 
     def _anchor_candidates(
