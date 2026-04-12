@@ -645,6 +645,18 @@ class _DynamicSearchState(Generic[N, V]):
     target_var_to_query_identifier: CanonicalVariableMapping[V]
     used_query_identifiers: dict[VariableClass, set[V]]
 
+
+@dataclass(slots=True)
+class _SearchCaches(Generic[N, V]):
+    refined_masks: dict[tuple[Any, ...], dict[CanonicalNode, int] | None] = field(default_factory=dict)
+    propagated_masks: dict[
+        tuple[Any, ...],
+        tuple[dict[CanonicalNode, int], CanonicalVariableMapping[V], dict[VariableClass, set[V]]] | None,
+    ] = field(default_factory=dict)
+    dead_single_states: set[tuple[Any, ...]] = field(default_factory=set)
+    dead_collect_states: set[tuple[Any, ...]] = field(default_factory=set)
+
+
 def _build_query_data(
     graph: nx.DiGraph[N],
     labels: dict[N, L],
@@ -990,7 +1002,11 @@ class Database(Generic[N, L, V, I]):
         if not eligible:
             return []
 
-        if len(eligible) <= 16:
+        # For all-match enumeration, trie sharing only pays off once there is a
+        # meaningful amount of competition among eligible graphs. With just a few
+        # survivors, per-graph exhaustive search is often cheaper than exploring
+        # shared trie prefixes that never branch materially.
+        if len(eligible) <= 4:
             return self._query_direct(query_data, eligible)
 
         matches: list[MatchResult[N, V, I]] = []
@@ -1040,6 +1056,54 @@ class Database(Generic[N, L, V, I]):
     ) -> int:
         return math.perm(query_data.graph.number_of_nodes(), stored.graph.number_of_nodes())
 
+    def _canonical_node_mapping_signature(
+        self,
+        target_to_query: CanonicalNodeMapping[N],
+    ) -> tuple[tuple[CanonicalNode, N], ...]:
+        return tuple(sorted(target_to_query.items(), key=lambda item: item[0]))
+
+    def _canonical_variable_mapping_signature(
+        self,
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
+    ) -> tuple[tuple[VariableClass, tuple[tuple[CanonicalVariable, V], ...]], ...]:
+        return tuple(
+            (
+                variable_class,
+                tuple(sorted(identifier_mapping.items(), key=lambda item: item[0])),
+            )
+            for variable_class, identifier_mapping in sorted(target_var_to_query_identifier.items(), key=lambda item: item[0])
+        )
+
+    def _used_identifier_signature(
+        self,
+        used_query_identifiers: dict[VariableClass, set[V]],
+    ) -> tuple[tuple[VariableClass, tuple[V, ...]], ...]:
+        return tuple(
+            (
+                variable_class,
+                tuple(sorted(identifiers, key=repr)),
+            )
+            for variable_class, identifiers in sorted(used_query_identifiers.items(), key=lambda item: item[0])
+        )
+
+    def _mask_signature(
+        self,
+        masks: dict[CanonicalNode, int],
+    ) -> tuple[tuple[CanonicalNode, int], ...]:
+        return tuple(sorted(masks.items(), key=lambda item: item[0]))
+
+    def _state_signature(
+        self,
+        target_to_query: CanonicalNodeMapping[N],
+        masks: dict[CanonicalNode, int],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
+    ) -> tuple[Any, ...]:
+        return (
+            self._canonical_node_mapping_signature(target_to_query),
+            self._mask_signature(masks),
+            self._canonical_variable_mapping_signature(target_var_to_query_identifier),
+        )
+
     def _direct_graph_priority(
         self,
         stored: _StoredGraph[N, L, V],
@@ -1080,14 +1144,19 @@ class Database(Generic[N, L, V, I]):
             return 0
 
         stored = self._graphs[graph_index]
+        search_caches = _SearchCaches[N, V]()
         local_matches: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]] = []
         if match_limit > 1:
-            self._enumerate_single_graph_best_first(
+            local_matches = self._enumerate_single_graph_matches(
                 stored,
                 query_data,
-                local_matches,
+                {},
+                set(),
+                {},
+                {},
                 match_limit,
-                use_lookahead,
+                budget=self._native_budget(stored),
+                search_caches=search_caches,
             )
         else:
             match: tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None
@@ -1101,6 +1170,7 @@ class Database(Generic[N, L, V, I]):
                     {},
                     {},
                     budget=budget,
+                    search_caches=search_caches,
                 )
             except _SearchTimeout:
                 match = self._timeout_fallback_match(stored, query_data)
@@ -1585,6 +1655,7 @@ class Database(Generic[N, L, V, I]):
             for current_position, target_node in enumerate(stored.order[: len(matched_query_nodes)])
         }
         target_var_to_query_identifier, used_query_identifiers = self._variable_state(stored, target_to_query, query_data)
+        search_caches = _SearchCaches[N, V]()
         try:
             local_matches = self._enumerate_single_graph_matches(
                 stored,
@@ -1595,6 +1666,7 @@ class Database(Generic[N, L, V, I]):
                 used_query_identifiers,
                 self._all_match_limit(stored, query_data),
                 budget=self._native_budget(stored),
+                search_caches=search_caches,
             )
         except _SearchTimeout:
             fallback_match = self._timeout_fallback_match(stored, query_data)
@@ -2024,7 +2096,20 @@ class Database(Generic[N, L, V, I]):
         target_to_query: CanonicalNodeMapping[N],
         masks: dict[CanonicalNode, int],
         budget: _OperationBudget | None = None,
+        search_caches: _SearchCaches[N, V] | None = None,
     ) -> dict[CanonicalNode, int] | None:
+        cache_key: tuple[Any, ...] | None = None
+        if search_caches is not None:
+            cache_key = (
+                self._canonical_node_mapping_signature(target_to_query),
+                self._mask_signature(masks),
+            )
+            cached = search_caches.refined_masks.get(cache_key)
+            if cached is not None:
+                return dict(cached)
+            if cache_key in search_caches.refined_masks and search_caches.refined_masks[cache_key] is None:
+                return None
+
         refined = dict(masks)
 
         changed = True
@@ -2046,11 +2131,15 @@ class Database(Generic[N, L, V, I]):
                     ):
                         filtered_mask |= 1 << query_index
                 if not filtered_mask:
+                    if search_caches is not None and cache_key is not None:
+                        search_caches.refined_masks[cache_key] = None
                     return None
                 if filtered_mask != current_mask:
                     refined[target_node] = filtered_mask
                     changed = True
 
+        if search_caches is not None and cache_key is not None:
+            search_caches.refined_masks[cache_key] = dict(refined)
         return refined
 
     def _mask_candidate_order_key(
@@ -2088,11 +2177,32 @@ class Database(Generic[N, L, V, I]):
         target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
         budget: _OperationBudget | None = None,
+        search_caches: _SearchCaches[N, V] | None = None,
     ) -> tuple[dict[CanonicalNode, int], CanonicalVariableMapping[V], dict[VariableClass, set[V]]] | None:
+        cache_key: tuple[Any, ...] | None = None
+        if search_caches is not None:
+            cache_key = (
+                self._canonical_node_mapping_signature(target_to_query),
+                self._mask_signature(masks),
+                assigned_target,
+                assigned_query_index,
+                self._canonical_variable_mapping_signature(target_var_to_query_identifier),
+                self._used_identifier_signature(used_query_identifiers),
+            )
+            cached = search_caches.propagated_masks.get(cache_key)
+            if cached is not None:
+                cached_masks, cached_mapping, cached_used_ids = cached
+                restored_mapping, restored_used_ids = self._copy_variable_state(cached_mapping, cached_used_ids)
+                return dict(cached_masks), restored_mapping, restored_used_ids
+            if cache_key in search_caches.propagated_masks and search_caches.propagated_masks[cache_key] is None:
+                return None
+
         _spend(budget)
         assigned_bit = 1 << assigned_query_index
         next_masks = {target_node: (assigned_bit if target_node == assigned_target else mask & (query_data.all_nodes_mask ^ assigned_bit)) for target_node, mask in masks.items()}
         if any(mask == 0 for mask in next_masks.values()):
+            if search_caches is not None and cache_key is not None:
+                search_caches.propagated_masks[cache_key] = None
             return None
 
         next_target_var_to_query_identifier, next_used_query_identifiers = self._copy_variable_state(
@@ -2120,6 +2230,8 @@ class Database(Generic[N, L, V, I]):
                 current_mask = next_masks[variable_target]
                 reduced_mask = current_mask & same_identifier_mask
                 if not reduced_mask:
+                    if search_caches is not None and cache_key is not None:
+                        search_caches.propagated_masks[cache_key] = None
                     return None
                 next_masks[variable_target] = reduced_mask
 
@@ -2130,6 +2242,8 @@ class Database(Generic[N, L, V, I]):
                 continue
             reduced_mask = next_masks[successor] & successor_mask
             if not reduced_mask:
+                if search_caches is not None and cache_key is not None:
+                    search_caches.propagated_masks[cache_key] = None
                 return None
             next_masks[successor] = reduced_mask
         for predecessor in stored.predecessors[assigned_target]:
@@ -2137,6 +2251,8 @@ class Database(Generic[N, L, V, I]):
                 continue
             reduced_mask = next_masks[predecessor] & predecessor_mask
             if not reduced_mask:
+                if search_caches is not None and cache_key is not None:
+                    search_caches.propagated_masks[cache_key] = None
                 return None
             next_masks[predecessor] = reduced_mask
 
@@ -2146,10 +2262,16 @@ class Database(Generic[N, L, V, I]):
             target_to_query,
             next_masks,
             budget,
+            search_caches,
         )
         if refined is None:
+            if search_caches is not None and cache_key is not None:
+                search_caches.propagated_masks[cache_key] = None
             return None
 
+        if search_caches is not None and cache_key is not None:
+            stored_mapping, stored_used_ids = self._copy_variable_state(next_target_var_to_query_identifier, next_used_query_identifiers)
+            search_caches.propagated_masks[cache_key] = (dict(refined), stored_mapping, stored_used_ids)
         return refined, next_target_var_to_query_identifier, next_used_query_identifiers
 
     def _find_single_graph_match(
@@ -2161,10 +2283,12 @@ class Database(Generic[N, L, V, I]):
         target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
         budget: _OperationBudget | None = None,
+        search_caches: _SearchCaches[N, V] | None = None,
     ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
         if not self._partial_conditions_hold(stored, target_to_query, query_data):
             return None
 
+        active_search_caches = search_caches or _SearchCaches[N, V]()
         _spend(budget)
         masks = self._initial_single_graph_masks(
             stored,
@@ -2184,6 +2308,7 @@ class Database(Generic[N, L, V, I]):
             target_to_query,
             masks,
             budget,
+            active_search_caches,
         )
         if refined is None:
             return None
@@ -2197,6 +2322,7 @@ class Database(Generic[N, L, V, I]):
             variable_state[0],
             variable_state[1],
             budget,
+            active_search_caches,
         )
 
     def _enumerate_single_graph_matches(
@@ -2209,10 +2335,12 @@ class Database(Generic[N, L, V, I]):
         used_query_identifiers: dict[VariableClass, set[V]],
         match_limit: int,
         budget: _OperationBudget | None = None,
+        search_caches: _SearchCaches[N, V] | None = None,
     ) -> list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]]:
         if not self._partial_conditions_hold(stored, target_to_query, query_data):
             return []
 
+        active_search_caches = search_caches or _SearchCaches[N, V]()
         masks = self._initial_single_graph_masks(
             stored,
             query_data,
@@ -2231,6 +2359,7 @@ class Database(Generic[N, L, V, I]):
             target_to_query,
             masks,
             budget,
+            active_search_caches,
         )
         if refined is None:
             return []
@@ -2247,6 +2376,7 @@ class Database(Generic[N, L, V, I]):
             results,
             match_limit,
             budget,
+            active_search_caches,
         )
         return results
 
@@ -2733,11 +2863,24 @@ class Database(Generic[N, L, V, I]):
         target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
         budget: _OperationBudget | None = None,
+        search_caches: _SearchCaches[N, V] | None = None,
     ) -> tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None:
+        state_signature: tuple[Any, ...] | None = None
+        if search_caches is not None:
+            state_signature = self._state_signature(
+                target_to_query,
+                masks,
+                target_var_to_query_identifier,
+            )
+            if state_signature in search_caches.dead_single_states:
+                return None
+
         _spend(budget)
         if len(target_to_query) == len(stored.order):
             ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
             if not _conditions_hold(stored.full_conditions, ordered_query_nodes, query_data.node_ranks):
+                if search_caches is not None and state_signature is not None:
+                    search_caches.dead_single_states.add(state_signature)
                 return None
             return target_to_query.copy(), self._variable_mapping(stored, query_data, ordered_query_nodes)
 
@@ -2786,6 +2929,7 @@ class Database(Generic[N, L, V, I]):
                 target_var_to_query_identifier,
                 used_query_identifiers,
                 budget,
+                search_caches,
             )
             if propagated is None:
                 continue
@@ -2799,10 +2943,13 @@ class Database(Generic[N, L, V, I]):
                 next_target_var_to_query_identifier,
                 next_used_query_identifiers,
                 budget,
+                search_caches,
             )
             if match is not None:
                 return match
 
+        if search_caches is not None and state_signature is not None:
+            search_caches.dead_single_states.add(state_signature)
         return None
 
     def _search_single_graph_masks_collect(
@@ -2816,14 +2963,29 @@ class Database(Generic[N, L, V, I]):
         results: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]],
         match_limit: int,
         budget: _OperationBudget | None = None,
+        search_caches: _SearchCaches[N, V] | None = None,
     ) -> None:
         if len(results) >= match_limit:
             return
+
+        state_signature: tuple[Any, ...] | None = None
+        if search_caches is not None:
+            state_signature = self._state_signature(
+                target_to_query,
+                masks,
+                target_var_to_query_identifier,
+            )
+            if state_signature in search_caches.dead_collect_states:
+                return
+
+        initial_result_count = len(results)
         _spend(budget)
         if len(target_to_query) == len(stored.order):
             ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
             if _conditions_hold(stored.full_conditions, ordered_query_nodes, query_data.node_ranks):
                 results.append((target_to_query.copy(), self._variable_mapping(stored, query_data, ordered_query_nodes)))
+            elif search_caches is not None and state_signature is not None:
+                search_caches.dead_collect_states.add(state_signature)
             return
 
         frontier_targets = [
@@ -2866,6 +3028,7 @@ class Database(Generic[N, L, V, I]):
                 target_var_to_query_identifier,
                 used_query_identifiers,
                 budget,
+                search_caches,
             )
             if propagated is None:
                 continue
@@ -2881,7 +3044,15 @@ class Database(Generic[N, L, V, I]):
                 results,
                 match_limit,
                 budget,
+                search_caches,
             )
+
+        if (
+            search_caches is not None
+            and state_signature is not None
+            and len(results) == initial_result_count
+        ):
+            search_caches.dead_collect_states.add(state_signature)
 
     def _dynamic_label_candidates(
         self,
