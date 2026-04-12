@@ -618,14 +618,14 @@ class TestFuzz(unittest.TestCase):
     def test_fuzz_exact_small(self):
         def rcg(r: Random, n: int | None = None):
             if n is None:
-                n = r.randrange(2, 6)
+                n = r.randrange(2, 10)
             return random_connected_graph(
                 r,
                 range(n),
                 range(r.randrange(1, 5)),
                 range(r.randrange(1, 8)),
                 r.random() * 0.4,
-                r.random() * 0.35,
+                r.random() * 0.9,
             )
 
         for i in range(EXACT_FUZZ_OFFSET, EXACT_FUZZ_OFFSET + EXACT_FUZZ_COUNT):
@@ -638,7 +638,7 @@ class TestFuzz(unittest.TestCase):
                 indexed_graphs[ident] = graph
                 d.index(graph, ident)
 
-            targets = [rcg(r, r.randrange(2, 5)) for _ in range(r.randrange(1, 3))]
+            targets = [rcg(r, r.randrange(2, 9)) for _ in range(r.randrange(1, 3))]
             next_ident = len(indexed_graphs)
             for target in targets:
                 indexed_graphs[next_ident] = target
@@ -646,14 +646,14 @@ class TestFuzz(unittest.TestCase):
                 next_ident += 1
 
             needed_nodes = max(1, sum(len(t) for t in targets))
-            query = rcg(r, r.randrange(max(needed_nodes, 3), max(needed_nodes + 1, 8)))
+            query = rcg(r, r.randrange(max(needed_nodes, 3), max(needed_nodes + 1, 10)))
             available_nodes = list(query)
             variables = list(range(1000))
             r.shuffle(variables)
             r.shuffle(available_nodes)
             for target in targets:
                 if len(available_nodes) < len(target):
-                    break
+                    assert False, "misdesigned testcase"
                 embed_graph(query, target, available_nodes, variables)
 
             actual_results = list(d.query(query))
