@@ -49,17 +49,17 @@ def random_connected_graph(r: Random, nodes: range, labels: range, variables: ra
 
 def is_valid_match(
     target_graph: nx.DiGraph[int],
-    target_idents: set[int],
+    target_ident: int,
     query_graph: nx.DiGraph[int],
     node_mapping: dict[int, int],
     variable_mapping: Mapping[int, Mapping[int, int]],
-    found_idents: set[int],
+    found_ident: int,
 ) -> bool:
     if set(node_mapping) != set(target_graph.nodes):
         return False
     if len(set(node_mapping.values())) != len(node_mapping):
         return False
-    if not target_idents.issubset(found_idents):
+    if found_ident != target_ident:
         return False
 
     computed_variable_mapping: defaultdict[int, dict[int, int]] = defaultdict(dict)
@@ -114,47 +114,6 @@ def embed_graph(query: nx.DiGraph[int], t: nx.DiGraph[int], available_nodes: lis
         )
 
 
-def corresponds_to_witness_graph(target_graph: nx.DiGraph[int], witness_graph: nx.DiGraph[int]) -> bool:
-    if target_graph.number_of_nodes() != witness_graph.number_of_nodes():
-        return False
-    if target_graph.number_of_edges() != witness_graph.number_of_edges():
-        return False
-
-    matcher = DiGraphMatcher(
-        target_graph,
-        witness_graph,
-        node_match=lambda left_attrs, right_attrs: (
-            left_attrs["label"] == right_attrs["label"]
-            and len(left_attrs["vars"]) == len(right_attrs["vars"])
-        ),
-    )
-
-    for mapping in matcher.isomorphisms_iter():
-        target_to_witness_vars: defaultdict[int, dict[int, int]] = defaultdict(dict)
-        witness_to_target_vars: defaultdict[int, dict[int, int]] = defaultdict(dict)
-        for target_node, witness_node in mapping.items():
-            target_vars = target_graph.nodes[target_node]["vars"]
-            witness_vars = witness_graph.nodes[witness_node]["vars"]
-            if len(target_vars) != len(witness_vars):
-                break
-            for slot, target_identifier in enumerate(target_vars):
-                witness_identifier = witness_vars[slot]
-                existing = target_to_witness_vars[slot].get(target_identifier)
-                if existing is not None and existing != witness_identifier:
-                    break
-                reverse_existing = witness_to_target_vars[slot].get(witness_identifier)
-                if reverse_existing is not None and reverse_existing != target_identifier:
-                    break
-                target_to_witness_vars[slot][target_identifier] = witness_identifier
-                witness_to_target_vars[slot][witness_identifier] = target_identifier
-            else:
-                continue
-            break
-        else:
-            return True
-
-    return False
-
 class TestRegressions(unittest.TestCase):
     def test_label_aware_symmetry_conditions(self):
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
@@ -177,9 +136,8 @@ class TestRegressions(unittest.TestCase):
         result = list(d.query(query))
 
         assert len(result) == 1
-        witness_graph, found_node_mapping, found_var_mapping, found_idents = result[0]
-        assert corresponds_to_witness_graph(target, witness_graph)
-        assert is_valid_match(witness_graph, {999}, query, found_node_mapping, found_var_mapping, found_idents)
+        found_node_mapping, found_var_mapping, found_ident = result[0]
+        assert is_valid_match(target, 999, query, found_node_mapping, found_var_mapping, found_ident)
 
 class TestUnits(unittest.TestCase):
     def test_multiple_identifiers(self):
@@ -210,14 +168,16 @@ class TestUnits(unittest.TestCase):
 
         result = list(d.query(query))
 
-        assert len(result) == 1
-        witness_graph, found_node_mapping, found_var_mapping, found_idents = result[0]
-        assert corresponds_to_witness_graph(first_target, witness_graph)
-        assert corresponds_to_witness_graph(second_target, witness_graph)
-        assert is_valid_match(witness_graph, {999, 998}, query, found_node_mapping, found_var_mapping, found_idents)
-        assert set(found_var_mapping) == {0}
-        assert set(found_var_mapping[0]) == {0, 3}
-        assert set(found_var_mapping[0].values()) == {152, 251}
+        assert len(result) == 2
+        by_ident = {found_ident: (found_node_mapping, found_var_mapping) for found_node_mapping, found_var_mapping, found_ident in result}
+        assert set(by_ident) == {998, 999}
+        first_mapping, first_vars = by_ident[999]
+        assert is_valid_match(first_target, 999, query, first_mapping, first_vars, 999)
+        second_mapping, second_vars = by_ident[998]
+        assert is_valid_match(second_target, 998, query, second_mapping, second_vars, 998)
+        assert set(first_vars) == {0}
+        assert set(first_vars[0]) == {0, 3}
+        assert set(first_vars[0].values()) == {152, 251}
 
     def test_multiple_matches(self):
         d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
@@ -243,7 +203,7 @@ class TestUnits(unittest.TestCase):
         result = list(d.query(query))
 
         assert len(result) == 2
-        found_nodes = frozenset(frozenset(mapping.values()) for _, mapping, _, _ in result)
+        found_nodes = frozenset(frozenset(mapping.values()) for mapping, _, _ in result)
         assert found_nodes == frozenset({frozenset({11,12,13}),frozenset({12,13,14})})
 
 
@@ -276,16 +236,27 @@ class TestFuzz(unittest.TestCase):
             for t in targets:
                 embed_graph(query, t, available_nodes, variables)
 
-            result = list(d.query(query))
-            for target_ident, target_graph in enumerate(targets):
-                for witness_graph, found_node_mapping, found_var_mapping, found_idents in result:
-                    if (
-                        corresponds_to_witness_graph(target_graph, witness_graph)
-                        and is_valid_match(witness_graph, {target_ident + 100}, query, found_node_mapping, found_var_mapping, found_idents)
-                    ):
-                        break
-                else:
-                    assert False, "There is no corresponding finding for this target"
+            remaining_target_graphs = {
+                target_ident + 100: target_graph
+                for target_ident, target_graph in enumerate(targets)
+            }
+            for found_node_mapping, found_var_mapping, found_ident in d.query(query):
+                target_graph = remaining_target_graphs.get(found_ident)
+                if target_graph is None:
+                    continue
+                assert is_valid_match(
+                    target_graph,
+                    found_ident,
+                    query,
+                    found_node_mapping,
+                    found_var_mapping,
+                    found_ident,
+                )
+                del remaining_target_graphs[found_ident]
+                if not remaining_target_graphs:
+                    break
+
+            assert not remaining_target_graphs, "There is no corresponding finding for this target"
 
             print("OK", i)
 
@@ -321,16 +292,27 @@ class TestFuzz(unittest.TestCase):
             for t in targets:
                 embed_graph(query, t, available_nodes, variables)
 
-            result = list(d.query(query))
-            for target_ident, target_graph in enumerate(targets):
-                for witness_graph, found_node_mapping, found_var_mapping, found_idents in result:
-                    if (
-                        corresponds_to_witness_graph(target_graph, witness_graph)
-                        and is_valid_match(witness_graph, {target_ident + 100}, query, found_node_mapping, found_var_mapping, found_idents)
-                    ):
-                        break
-                else:
-                    assert False, "There is no corresponding finding for this target"
+            remaining_target_graphs = {
+                target_ident + 100: target_graph
+                for target_ident, target_graph in enumerate(targets)
+            }
+            for found_node_mapping, found_var_mapping, found_ident in d.query(query):
+                target_graph = remaining_target_graphs.get(found_ident)
+                if target_graph is None:
+                    continue
+                assert is_valid_match(
+                    target_graph,
+                    found_ident,
+                    query,
+                    found_node_mapping,
+                    found_var_mapping,
+                    found_ident,
+                )
+                del remaining_target_graphs[found_ident]
+                if not remaining_target_graphs:
+                    break
+
+            assert not remaining_target_graphs, "There is no corresponding finding for this target"
 
             print("OK", i)
 
@@ -373,16 +355,27 @@ class TestFuzz(unittest.TestCase):
             for t in targets:
                 embed_graph(query, t, available_nodes, variables)
 
-            result = list(d.query(query))
-            for target_ident, target_graph in enumerate(targets):
-                for witness_graph, found_node_mapping, found_var_mapping, found_idents in result:
-                    if (
-                        corresponds_to_witness_graph(target_graph, witness_graph)
-                        and is_valid_match(witness_graph, {target_ident + 2000}, query, found_node_mapping, found_var_mapping, found_idents)
-                    ):
-                        break
-                else:
-                    assert False, "There is no corresponding finding for this target"
+            remaining_target_graphs = {
+                target_ident + 2000: target_graph
+                for target_ident, target_graph in enumerate(targets)
+            }
+            for found_node_mapping, found_var_mapping, found_ident in d.query(query):
+                target_graph = remaining_target_graphs.get(found_ident)
+                if target_graph is None:
+                    continue
+                assert is_valid_match(
+                    target_graph,
+                    found_ident,
+                    query,
+                    found_node_mapping,
+                    found_var_mapping,
+                    found_ident,
+                )
+                del remaining_target_graphs[found_ident]
+                if not remaining_target_graphs:
+                    break
+
+            assert not remaining_target_graphs, "There is no corresponding finding for this target"
 
             print("OK", i)
 

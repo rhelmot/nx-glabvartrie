@@ -33,8 +33,9 @@ NodeMapping: TypeAlias = dict[N, N]
 CanonicalNodeMapping: TypeAlias = dict[CanonicalNode, N]
 VariableMapping: TypeAlias = dict[VariableClass, dict[V, V]]
 CanonicalVariableMapping: TypeAlias = dict[VariableClass, dict[CanonicalVariable, V]]
-MatchResult: TypeAlias = tuple["nx.DiGraph[N]", NodeMapping[N], VariableMapping[V], set[I]]
+MatchResult: TypeAlias = tuple[NodeMapping[N], VariableMapping[V], I]
 MatchSignature: TypeAlias = Hashable
+InternalMatchSignature: TypeAlias = tuple[int, tuple[Any, ...]]
 
 
 def _env_enabled(name: str, default: bool) -> bool:
@@ -604,6 +605,12 @@ class _StoredGraph(Generic[N, L, V]):
     future_in_positions: tuple[tuple[int, ...], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _IdentifierWitness(Generic[N, V]):
+    canonical_to_witness_nodes: dict[CanonicalNode, N]
+    canonical_to_witness_variables: dict[VariableClass, dict[CanonicalVariable, V]]
+
+
 @dataclass(slots=True)
 class _TrieNode:
     depth: int
@@ -722,7 +729,7 @@ class Database(Generic[N, L, V, I]):
         self._node_label = node_label
         self._node_vars = node_vars
         self._graphs: list[_StoredGraph[N, L, V]] = []
-        self._idents: list[set[I]] = []
+        self._idents: list[dict[I, _IdentifierWitness[N, V]]] = []
         self._canonical_buckets: defaultdict[tuple[Any, ...], list[int]] = defaultdict(list)
         self._root = _TrieNode(depth=0, topology_pattern=None)
         self._heuristic_fallbacks_enabled = _env_enabled("GLABVARTRIE_ENABLE_HEURISTIC_FALLBACKS", True)
@@ -733,6 +740,19 @@ class Database(Generic[N, L, V, I]):
         self._anchored_ops = _env_int("GLABVARTRIE_ANCHORED_OPS", 6_000_000)
         self._z3_rlimit = _env_int("GLABVARTRIE_Z3_RLIMIT", 5_000_000)
         self._ortools_deterministic_time = _env_float("GLABVARTRIE_ORTOOLS_DETERMINISTIC_TIME", 0.2)
+
+    def _identifier_witness(
+        self,
+        canonical_to_witness_nodes: dict[CanonicalNode, N],
+        canonical_to_witness_variables: dict[VariableClass, dict[CanonicalVariable, V]],
+    ) -> _IdentifierWitness[N, V]:
+        return _IdentifierWitness(
+            canonical_to_witness_nodes=dict(canonical_to_witness_nodes),
+            canonical_to_witness_variables={
+                variable_class: dict(identifier_mapping)
+                for variable_class, identifier_mapping in canonical_to_witness_variables.items()
+            },
+        )
 
     def _native_budget(self, stored: _StoredGraph[N, L, V]) -> _OperationBudget | None:
         if stored.graph.number_of_nodes() < 50:
@@ -964,14 +984,18 @@ class Database(Generic[N, L, V, I]):
             canonical_to_witness_nodes=canonical_to_witness_nodes,
             canonical_to_witness_variables=canonical_to_witness_variables,
         )
+        identifier_witness = self._identifier_witness(
+            canonical_to_witness_nodes,
+            canonical_to_witness_variables,
+        )
         bucket_key = self._canonical_bucket_key(stored)
         for graph_index in self._canonical_buckets[bucket_key]:
             if self._stored_graphs_equivalent(self._graphs[graph_index], stored):
-                self._idents[graph_index].add(ident)
+                self._idents[graph_index][ident] = identifier_witness
                 return
         graph_index = len(self._graphs)
         self._graphs.append(stored)
-        self._idents.append({ident})
+        self._idents.append({ident: identifier_witness})
         self._canonical_buckets[bucket_key].append(graph_index)
 
         node = self._root
@@ -990,7 +1014,7 @@ class Database(Generic[N, L, V, I]):
         if node.full_conditions is None:
             node.full_conditions = stored.full_conditions
 
-    def query(self, g: nx.DiGraph[N]) -> list[MatchResult[N, V, I]]:
+    def query(self, g: nx.DiGraph[N]) -> Iterator[MatchResult[N, V, I]]:
         query_labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
         query_variables = {node: self._node_vars(g.nodes[node]) for node in g.nodes}
         query_data = _build_query_data(g, query_labels, query_variables)
@@ -1001,50 +1025,53 @@ class Database(Generic[N, L, V, I]):
             if self._can_match(stored, query_data)
         }
         if not eligible:
-            return []
+            return
+            yield
 
-        matches: list[MatchResult[N, V, I]] = []
-        match_index_by_signature: dict[MatchSignature, int] = {}
-        direct_eligible = {
-            graph_index
-            for graph_index in eligible
-            if self._graphs[graph_index].graph.number_of_nodes() < 50
-        }
-        if direct_eligible:
-            self._merge_match_results(
-                matches,
-                match_index_by_signature,
-                self._query_direct(query_data, direct_eligible),
-            )
-
-        remaining_eligible = eligible - direct_eligible
-        if not remaining_eligible:
-            return matches
-        if len(remaining_eligible) <= 4:
-            self._merge_match_results(
-                matches,
-                match_index_by_signature,
-                self._query_direct(query_data, remaining_eligible),
-            )
-            return matches
+        seen_results: set[tuple[int, tuple[N, ...], I]] = set()
+        yield from self._query_direct_first_matches(query_data, eligible, seen_results)
+        if len(eligible) <= 4:
+            yield from self._query_direct(query_data, eligible, seen_results)
+            return
 
         used_query_nodes: set[N] = set()
         matched_query_nodes: list[N] = []
 
         for child in sorted(self._root.children.values(), key=self._node_priority, reverse=True):
-            if child.descendant_graph_indices.isdisjoint(remaining_eligible):
+            if child.descendant_graph_indices.isdisjoint(eligible):
                 continue
-            self._search(child, query_data, remaining_eligible, matched_query_nodes, used_query_nodes, matches, match_index_by_signature)
+            yield from self._search(child, query_data, eligible, matched_query_nodes, used_query_nodes, seen_results)
 
-        return matches
+    def _query_direct_first_matches(
+        self,
+        query_data: _QueryData[N, L, V],
+        eligible: set[int],
+        seen_results: set[tuple[int, tuple[N, ...], I]],
+    ) -> Iterator[MatchResult[N, V, I]]:
+        graph_order = sorted(
+            eligible,
+            key=lambda graph_index: (
+                self._direct_graph_priority(self._graphs[graph_index], query_data),
+                graph_index,
+            ),
+        )
+        for graph_index in graph_order:
+            yield from self._collect_single_graph_matches(
+                graph_index,
+                query_data,
+                {graph_index},
+                seen_results,
+                1,
+                use_lookahead=True,
+                allow_timeout_fallback=False,
+            )
 
     def _query_direct(
         self,
         query_data: _QueryData[N, L, V],
         eligible: set[int],
-    ) -> list[MatchResult[N, V, I]]:
-        matches: list[MatchResult[N, V, I]] = []
-        match_index_by_signature: dict[MatchSignature, int] = {}
+        seen_results: set[tuple[int, tuple[N, ...], I]],
+    ) -> Iterator[MatchResult[N, V, I]]:
         remaining = set(eligible)
 
         graph_order = sorted(
@@ -1057,17 +1084,14 @@ class Database(Generic[N, L, V, I]):
         for graph_index in graph_order:
             if graph_index not in remaining:
                 continue
-            self._collect_single_graph_matches(
+            yield from self._collect_single_graph_matches(
                 graph_index,
                 query_data,
                 remaining,
-                matches,
-                match_index_by_signature,
+                seen_results,
                 self._all_match_limit(self._graphs[graph_index], query_data),
                 use_lookahead=True,
             )
-
-        return matches
 
     def _all_match_limit(
         self,
@@ -1161,20 +1185,20 @@ class Database(Generic[N, L, V, I]):
         graph_index: int,
         query_data: _QueryData[N, L, V],
         eligible: set[int],
-        matches: list[MatchResult[N, V, I]],
-        match_index_by_signature: dict[MatchSignature, int],
+        seen_results: set[tuple[int, tuple[N, ...], I]],
         match_limit: int,
         use_lookahead: bool,
-    ) -> int:
+        allow_timeout_fallback: bool = True,
+    ) -> Iterator[MatchResult[N, V, I]]:
         if graph_index not in eligible or match_limit <= 0:
-            return 0
+            return
+            yield
 
         stored = self._graphs[graph_index]
-        search_caches = _SearchCaches[N, V]()
-        local_matches: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]] = []
+        emitted = False
         if match_limit > 1:
             try:
-                local_matches = self._enumerate_single_graph_matches(
+                for node_mapping, variable_mapping in self._iter_single_graph_matches(
                     stored,
                     query_data,
                     {},
@@ -1183,12 +1207,27 @@ class Database(Generic[N, L, V, I]):
                     {},
                     match_limit,
                     budget=self._native_budget(stored),
-                    search_caches=search_caches,
-                )
+                    search_caches=None,
+                ):
+                    emitted = True
+                    yield from self._iter_match_results(
+                        graph_index,
+                        node_mapping,
+                        variable_mapping,
+                        seen_results,
+                    )
             except _SearchTimeout:
-                fallback_match = self._timeout_fallback_match(stored, query_data)
-                local_matches = [] if fallback_match is None else [fallback_match]
+                fallback_match = self._timeout_fallback_match(stored, query_data) if allow_timeout_fallback else None
+                if fallback_match is not None:
+                    emitted = True
+                    yield from self._iter_match_results(
+                        graph_index,
+                        fallback_match[0],
+                        fallback_match[1],
+                        seen_results,
+                    )
         else:
+            search_caches = _SearchCaches[N, V]()
             match: tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]] | None
             try:
                 budget = self._native_budget(stored)
@@ -1203,15 +1242,18 @@ class Database(Generic[N, L, V, I]):
                     search_caches=search_caches,
                 )
             except _SearchTimeout:
-                match = self._timeout_fallback_match(stored, query_data)
+                match = self._timeout_fallback_match(stored, query_data) if allow_timeout_fallback else None
             if match is not None:
-                local_matches.append(match)
-        for node_mapping, variable_mapping in local_matches:
-            self._append_match(matches, match_index_by_signature, graph_index, node_mapping, variable_mapping)
+                emitted = True
+                yield from self._iter_match_results(
+                    graph_index,
+                    match[0],
+                    match[1],
+                    seen_results,
+                )
 
-        if local_matches:
+        if emitted:
             eligible.discard(graph_index)
-        return len(local_matches)
 
     def _copy_variable_state(
         self,
@@ -1237,63 +1279,46 @@ class Database(Generic[N, L, V, I]):
             },
         )
 
-    def _match_signature(
+    def _internal_match_signature(
         self,
-        node_mapping: NodeMapping[N],
-        variable_mapping: VariableMapping[V],
-    ) -> MatchSignature:
+        graph_index: int,
+        stored: _StoredGraph[N, L, V],
+        node_mapping: CanonicalNodeMapping[N],
+    ) -> InternalMatchSignature:
         return (
-            frozenset(node_mapping.items()),
-            frozenset(
-                (variable_class, frozenset(identifier_mapping.items()))
-                for variable_class, identifier_mapping in variable_mapping.items()
-            ),
+            graph_index,
+            tuple(node_mapping[target_node] for target_node in stored.order),
         )
 
-    def _append_match(
+    def _iter_match_results(
         self,
-        matches: list[MatchResult[N, V, I]],
-        match_index_by_signature: dict[MatchSignature, int],
         graph_index: int,
         node_mapping: CanonicalNodeMapping[N],
         variable_mapping: CanonicalVariableMapping[V],
-    ) -> None:
+        seen_results: set[tuple[int, tuple[N, ...], I]],
+    ) -> Iterator[MatchResult[N, V, I]]:
         stored = self._graphs[graph_index]
-        witness_node_mapping = {
-            stored.canonical_to_witness_nodes[target_node]: query_node
-            for target_node, query_node in node_mapping.items()
-        }
-        witness_variable_mapping: dict[VariableClass, dict[V, V]] = {}
-        for variable_class, identifier_mapping in variable_mapping.items():
-            witness_identifier_mapping: dict[V, V] = {}
-            canonical_to_witness_identifiers = stored.canonical_to_witness_variables.get(variable_class, {})
-            for canonical_identifier, query_identifier in identifier_mapping.items():
-                witness_identifier_mapping[canonical_to_witness_identifiers[canonical_identifier]] = query_identifier
-            witness_variable_mapping[variable_class] = witness_identifier_mapping
+        ordered_query_nodes = tuple(node_mapping[target_node] for target_node in stored.order)
 
-        signature = self._match_signature(witness_node_mapping, witness_variable_mapping)
-        match_index = match_index_by_signature.get(signature)
-        if match_index is not None:
-            _, _, _, identifiers = matches[match_index]
-            identifiers.update(self._idents[graph_index])
-            return
-        match_index_by_signature[signature] = len(matches)
-        matches.append((stored.witness_graph, witness_node_mapping, witness_variable_mapping, set(self._idents[graph_index])))
-
-    def _merge_match_results(
-        self,
-        matches: list[MatchResult[N, V, I]],
-        match_index_by_signature: dict[MatchSignature, int],
-        new_matches: list[MatchResult[N, V, I]],
-    ) -> None:
-        for graph, node_mapping, variable_mapping, identifiers in new_matches:
-            signature = self._match_signature(node_mapping, variable_mapping)
-            match_index = match_index_by_signature.get(signature)
-            if match_index is not None:
-                matches[match_index][3].update(identifiers)
+        for ident, witness in self._idents[graph_index].items():
+            signature = (graph_index, ordered_query_nodes, ident)
+            if signature in seen_results:
                 continue
-            match_index_by_signature[signature] = len(matches)
-            matches.append((graph, node_mapping, variable_mapping, set(identifiers)))
+            seen_results.add(signature)
+
+            witness_node_mapping = {
+                witness.canonical_to_witness_nodes[target_node]: query_node
+                for target_node, query_node in node_mapping.items()
+            }
+            witness_variable_mapping: dict[VariableClass, dict[V, V]] = {}
+            for variable_class, identifier_mapping in variable_mapping.items():
+                witness_identifier_mapping: dict[V, V] = {}
+                canonical_to_witness_identifiers = witness.canonical_to_witness_variables.get(variable_class, {})
+                for canonical_identifier, query_identifier in identifier_mapping.items():
+                    witness_identifier_mapping[canonical_to_witness_identifiers[canonical_identifier]] = query_identifier
+                witness_variable_mapping[variable_class] = witness_identifier_mapping
+
+            yield witness_node_mapping, witness_variable_mapping, ident
 
     def _timeout_fallback_match(
         self,
@@ -1596,25 +1621,23 @@ class Database(Generic[N, L, V, I]):
         eligible: set[int],
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
-        matches: list[MatchResult[N, V, I]],
-        match_index_by_signature: dict[MatchSignature, int],
+        seen_results: set[tuple[int, tuple[N, ...], I]],
         candidate_plan: list[tuple[N, frozenset[int]]] | None = None,
-    ) -> None:
+    ) -> Iterator[MatchResult[N, V, I]]:
         active_graphs = node.descendant_graph_indices & eligible
         if not active_graphs or node.topology_pattern is None:
             return
 
         if len(active_graphs) == 1:
             graph_index = next(iter(active_graphs))
-            self._search_single_graph(
+            yield from self._search_single_graph(
                 graph_index,
                 node.depth - 1,
                 query_data,
                 eligible,
                 matched_query_nodes,
                 used_query_nodes,
-                matches,
-                match_index_by_signature,
+                seen_results,
                 candidate_plan,
             )
             return
@@ -1643,12 +1666,11 @@ class Database(Generic[N, L, V, I]):
                             target_node: matched_query_nodes[position]
                             for position, target_node in enumerate(stored.order)
                         }
-                        self._append_match(
-                            matches,
-                            match_index_by_signature,
+                        yield from self._iter_match_results(
                             graph_index,
                             target_to_query,
                             self._variable_mapping(stored, query_data, matched_query_nodes),
+                            seen_results,
                         )
 
                 remaining_active = set(next_active_graphs & eligible)
@@ -1676,14 +1698,13 @@ class Database(Generic[N, L, V, I]):
 
                 child_plans.sort(key=lambda item: (item[0], item[1], self._node_priority(item[2])), reverse=False)
                 for _, _, child, child_candidates in child_plans:
-                    self._search(
+                    yield from self._search(
                         child,
                         query_data,
                         remaining_active,
                         matched_query_nodes,
                         used_query_nodes,
-                        matches,
-                        match_index_by_signature,
+                        seen_results,
                         child_candidates,
                     )
 
@@ -1698,15 +1719,15 @@ class Database(Generic[N, L, V, I]):
         eligible: set[int],
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
-        matches: list[MatchResult[N, V, I]],
-        match_index_by_signature: dict[MatchSignature, int],
+        seen_results: set[tuple[int, tuple[N, ...], I]],
         candidate_plan: list[tuple[N, frozenset[int]]] | None = None,
-    ) -> bool:
+    ) -> Iterator[MatchResult[N, V, I]]:
         del position
         del candidate_plan
 
         if graph_index not in eligible:
-            return False
+            return
+            yield
 
         stored = self._graphs[graph_index]
         target_to_query = {
@@ -1714,9 +1735,8 @@ class Database(Generic[N, L, V, I]):
             for current_position, target_node in enumerate(stored.order[: len(matched_query_nodes)])
         }
         target_var_to_query_identifier, used_query_identifiers = self._variable_state(stored, target_to_query, query_data)
-        search_caches = _SearchCaches[N, V]()
         try:
-            local_matches = self._enumerate_single_graph_matches(
+            for node_mapping, variable_mapping in self._iter_single_graph_matches(
                 stored,
                 query_data,
                 target_to_query,
@@ -1725,17 +1745,23 @@ class Database(Generic[N, L, V, I]):
                 used_query_identifiers,
                 self._all_match_limit(stored, query_data),
                 budget=self._native_budget(stored),
-                search_caches=search_caches,
-            )
+                search_caches=None,
+            ):
+                yield from self._iter_match_results(
+                    graph_index,
+                    node_mapping,
+                    variable_mapping,
+                    seen_results,
+                )
         except _SearchTimeout:
             fallback_match = self._timeout_fallback_match(stored, query_data)
-            local_matches = [] if fallback_match is None else [fallback_match]
-        if local_matches:
-            for node_mapping, variable_mapping in local_matches:
-                self._append_match(matches, match_index_by_signature, graph_index, node_mapping, variable_mapping)
-            return True
-
-        return False
+            if fallback_match is not None:
+                yield from self._iter_match_results(
+                    graph_index,
+                    fallback_match[0],
+                    fallback_match[1],
+                    seen_results,
+                )
 
     def _variable_state(
         self,
@@ -2410,10 +2436,37 @@ class Database(Generic[N, L, V, I]):
         budget: _OperationBudget | None = None,
         search_caches: _SearchCaches[N, V] | None = None,
     ) -> list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]]:
-        if not self._partial_conditions_hold(stored, target_to_query, query_data):
-            return []
+        return list(
+            self._iter_single_graph_matches(
+                stored,
+                query_data,
+                target_to_query,
+                used_query_nodes,
+                target_var_to_query_identifier,
+                used_query_identifiers,
+                match_limit,
+                budget,
+                search_caches,
+            )
+        )
 
-        active_search_caches = search_caches or _SearchCaches[N, V]()
+    def _iter_single_graph_matches(
+        self,
+        stored: _StoredGraph[N, L, V],
+        query_data: _QueryData[N, L, V],
+        target_to_query: CanonicalNodeMapping[N],
+        used_query_nodes: set[N],
+        target_var_to_query_identifier: CanonicalVariableMapping[V],
+        used_query_identifiers: dict[VariableClass, set[V]],
+        match_limit: int,
+        budget: _OperationBudget | None = None,
+        search_caches: _SearchCaches[N, V] | None = None,
+    ) -> Iterator[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]]:
+        if not self._partial_conditions_hold(stored, target_to_query, query_data):
+            return
+            yield
+
+        active_search_caches = search_caches
         masks = self._initial_single_graph_masks(
             stored,
             query_data,
@@ -2424,7 +2477,8 @@ class Database(Generic[N, L, V, I]):
             budget,
         )
         if masks is None:
-            return []
+            return
+            yield
 
         refined = self._refine_single_graph_masks(
             stored,
@@ -2435,22 +2489,20 @@ class Database(Generic[N, L, V, I]):
             active_search_caches,
         )
         if refined is None:
-            return []
+            return
+            yield
 
-        results: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]] = []
-        self._search_single_graph_masks_collect(
+        yield from self._iter_search_single_graph_masks_collect(
             stored,
             query_data,
             dict(target_to_query),
             dict(refined),
             target_var_to_query_identifier,
             used_query_identifiers,
-            results,
             match_limit,
             budget,
             active_search_caches,
         )
-        return results
 
     def _solver_candidates_from_masks(
         self,
@@ -3024,7 +3076,7 @@ class Database(Generic[N, L, V, I]):
             search_caches.dead_single_states.add(state_signature)
         return None
 
-    def _search_single_graph_masks_collect(
+    def _iter_search_single_graph_masks_collect(
         self,
         stored: _StoredGraph[N, L, V],
         query_data: _QueryData[N, L, V],
@@ -3032,18 +3084,15 @@ class Database(Generic[N, L, V, I]):
         masks: dict[CanonicalNode, int],
         target_var_to_query_identifier: CanonicalVariableMapping[V],
         used_query_identifiers: dict[VariableClass, set[V]],
-        results: list[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]],
         match_limit: int,
         budget: _OperationBudget | None = None,
         search_caches: _SearchCaches[N, V] | None = None,
-    ) -> None:
-        if len(results) >= match_limit:
-            return
+    ) -> Iterator[tuple[CanonicalNodeMapping[N], CanonicalVariableMapping[V]]]:
         _spend(budget)
         if len(target_to_query) == len(stored.order):
             ordered_query_nodes = [target_to_query[target_node] for target_node in stored.order]
             if _conditions_hold(stored.full_conditions, ordered_query_nodes, query_data.node_ranks):
-                results.append((target_to_query.copy(), self._variable_mapping(stored, query_data, ordered_query_nodes)))
+                yield target_to_query.copy(), self._variable_mapping(stored, query_data, ordered_query_nodes)
             return
 
         frontier_targets = [
@@ -3066,8 +3115,9 @@ class Database(Generic[N, L, V, I]):
             _iter_mask_indices(masks[target_node]),
             key=lambda query_index: self._mask_candidate_order_key(stored, target_node, query_index, masks, query_data),
         )
+        emitted_count = 0
         for query_index in candidate_indices:
-            if len(results) >= match_limit:
+            if emitted_count >= match_limit:
                 return
             _spend(budget)
             query_node = query_data.index_to_node[query_index]
@@ -3092,18 +3142,21 @@ class Database(Generic[N, L, V, I]):
                 continue
 
             next_masks, next_target_var_to_query_identifier, next_used_query_identifiers = propagated
-            self._search_single_graph_masks_collect(
+            for match in self._iter_search_single_graph_masks_collect(
                 stored,
                 query_data,
                 next_target_to_query,
                 next_masks,
                 next_target_var_to_query_identifier,
                 next_used_query_identifiers,
-                results,
                 match_limit,
                 budget,
                 search_caches,
-            )
+            ):
+                yield match
+                emitted_count += 1
+                if emitted_count >= match_limit:
+                    return
 
     def _dynamic_label_candidates(
         self,
