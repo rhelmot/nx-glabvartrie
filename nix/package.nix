@@ -1,15 +1,18 @@
 {
     lib,
-    python3,
+    buildPythonPackage,
+    setuptools,
+    networkx,
+    z3-solver,
 }:
-python3.pkgs.buildPythonPackage {
+buildPythonPackage {
     pname = "nx-glabtrie";
     version = "0.1.0";
     src = ./..;
     pyproject = true;
 
-    build-system = with python3.pkgs; [ setuptools ];
-    dependencies = with python3.pkgs; [ networkx z3-solver ];
+    build-system = [ setuptools ];
+    dependencies = [ networkx z3-solver ];
 
     meta = {
         license = with lib.licenses; [ publicDomain ];
