@@ -477,6 +477,17 @@ class TestUnits(unittest.TestCase):
         found_nodes = frozenset(frozenset(mapping.values()) for mapping, _, _ in result)
         assert found_nodes == frozenset({frozenset({11,12,13}),frozenset({12,13,14})})
 
+    def test_query_session_exclude_previous_subgraph(self):
+        d, _, _, query = self._two_identifier_database()
+
+        session = d.query(query)
+        first_match = next(session)
+        assert first_match[2] in {998, 999}
+
+        session.exclude_previous_subgraph()
+
+        assert list(session) == []
+
     def test_unsortable_nodes_with_node_order_key(self):
         class Node:
             def __init__(self, key: int):

@@ -43,6 +43,30 @@ def _default_node_order_key(node: Hashable) -> Any:
     return node
 
 
+class QuerySession(Generic[N, V, I], Iterator[MatchResult[N, V, I]]):
+    def __init__(
+        self,
+        iterator: Iterator[MatchResult[N, V, I]],
+        excluded_subgraphs: set[frozenset[N]],
+    ) -> None:
+        self._iterator = iterator
+        self._excluded_subgraphs = excluded_subgraphs
+        self._previous_subgraph: frozenset[N] | None = None
+
+    def __iter__(self) -> QuerySession[N, V, I]:
+        return self
+
+    def __next__(self) -> MatchResult[N, V, I]:
+        result = next(self._iterator)
+        self._previous_subgraph = frozenset(result[0].values())
+        return result
+
+    def exclude_previous_subgraph(self) -> None:
+        if self._previous_subgraph is None:
+            raise RuntimeError("No previous query result is available to exclude")
+        self._excluded_subgraphs.add(self._previous_subgraph)
+
+
 def _env_enabled(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -1151,10 +1175,11 @@ class Database(Generic[N, L, V, I]):
         if node.full_conditions is None:
             node.full_conditions = stored.full_conditions
 
-    def query(self, g: nx.DiGraph[N], *, best_effort: bool = False) -> Iterator[MatchResult[N, V, I]]:
+    def query(self, g: nx.DiGraph[N], *, best_effort: bool = False) -> QuerySession[N, V, I]:
         query_labels = {node: self._node_label(g.nodes[node]) for node in g.nodes}
         query_variables = {node: self._node_vars(g.nodes[node]) for node in g.nodes}
         query_data = _build_query_data(g, query_labels, query_variables, self._node_order_key)
+        excluded_subgraphs: set[frozenset[N]] = set()
 
         eligible = {
             index
@@ -1162,27 +1187,33 @@ class Database(Generic[N, L, V, I]):
             if self._can_match(stored, query_data)
         }
         if not eligible:
-            return
-            yield
+            return QuerySession(iter(()), excluded_subgraphs)
 
         if best_effort:
-            yield from self._query_best_effort(query_data, eligible)
-            return
-        yield from self._query_exact(query_data, eligible)
+            return QuerySession(
+                self._query_best_effort(query_data, eligible, excluded_subgraphs),
+                excluded_subgraphs,
+            )
+        return QuerySession(
+            self._query_exact(query_data, eligible, excluded_subgraphs),
+            excluded_subgraphs,
+        )
 
-    def query_best_effort(self, g: nx.DiGraph[N]) -> Iterator[MatchResult[N, V, I]]:
-        yield from self.query(g, best_effort=True)
+    def query_best_effort(self, g: nx.DiGraph[N]) -> QuerySession[N, V, I]:
+        return self.query(g, best_effort=True)
 
     def _query_exact(
         self,
         query_data: _QueryData[N, L, V],
         eligible: set[int],
+        excluded_subgraphs: set[frozenset[N]],
     ) -> Iterator[MatchResult[N, V, I]]:
         seen_results: set[tuple[int, frozenset[N], I]] = set()
         yield from self._query_direct(
             query_data,
             eligible,
             seen_results,
+            excluded_subgraphs,
             allow_timeout_fallback=False,
             use_native_budget=False,
         )
@@ -1191,6 +1222,7 @@ class Database(Generic[N, L, V, I]):
         self,
         query_data: _QueryData[N, L, V],
         eligible: set[int],
+        excluded_subgraphs: set[frozenset[N]],
     ) -> Iterator[MatchResult[N, V, I]]:
         seen_results: set[tuple[int, frozenset[N], I]] = set()
         seen_graphs: set[int] = set()
@@ -1198,6 +1230,7 @@ class Database(Generic[N, L, V, I]):
             query_data,
             eligible,
             seen_results,
+            excluded_subgraphs,
             seen_graphs,
             self._native_ops,
         )
@@ -1207,12 +1240,13 @@ class Database(Generic[N, L, V, I]):
                 query_data,
                 unseen_graphs,
                 seen_results,
+                excluded_subgraphs,
                 seen_graphs,
                 self._native_ops * 4,
             )
             unseen_graphs = eligible - seen_graphs
         if len(eligible) <= 4:
-            yield from self._query_direct(query_data, eligible, seen_results)
+            yield from self._query_direct(query_data, eligible, seen_results, excluded_subgraphs)
             return
 
         used_query_nodes: set[N] = set()
@@ -1229,6 +1263,7 @@ class Database(Generic[N, L, V, I]):
                     matched_query_nodes,
                     used_query_nodes,
                     seen_results,
+                    excluded_subgraphs,
                     allow_timeout_fallback=True,
                     use_native_budget=True,
                     first_match_only=True,
@@ -1244,6 +1279,7 @@ class Database(Generic[N, L, V, I]):
                 matched_query_nodes,
                 used_query_nodes,
                 seen_results,
+                excluded_subgraphs,
                 allow_timeout_fallback=True,
                 use_native_budget=True,
             )
@@ -1253,6 +1289,7 @@ class Database(Generic[N, L, V, I]):
         query_data: _QueryData[N, L, V],
         eligible: set[int],
         seen_results: set[tuple[int, frozenset[N], I]],
+        excluded_subgraphs: set[frozenset[N]],
         seen_graphs: set[int],
         first_match_budget_ops: int,
     ) -> Iterator[MatchResult[N, V, I]]:
@@ -1269,6 +1306,7 @@ class Database(Generic[N, L, V, I]):
                 query_data,
                 {graph_index},
                 seen_results,
+                excluded_subgraphs,
                 1,
                 use_lookahead=True,
                 allow_timeout_fallback=False,
@@ -1281,6 +1319,7 @@ class Database(Generic[N, L, V, I]):
         query_data: _QueryData[N, L, V],
         eligible: set[int],
         seen_results: set[tuple[int, frozenset[N], I]],
+        excluded_subgraphs: set[frozenset[N]],
         allow_timeout_fallback: bool = True,
         use_native_budget: bool = True,
     ) -> Iterator[MatchResult[N, V, I]]:
@@ -1301,6 +1340,7 @@ class Database(Generic[N, L, V, I]):
                 query_data,
                 remaining,
                 seen_results,
+                excluded_subgraphs,
                 self._all_match_limit(self._graphs[graph_index], query_data),
                 use_lookahead=True,
                 allow_timeout_fallback=allow_timeout_fallback,
@@ -1400,6 +1440,7 @@ class Database(Generic[N, L, V, I]):
         query_data: _QueryData[N, L, V],
         eligible: set[int],
         seen_results: set[tuple[int, frozenset[N], I]],
+        excluded_subgraphs: set[frozenset[N]],
         match_limit: int,
         use_lookahead: bool,
         allow_timeout_fallback: bool = True,
@@ -1432,6 +1473,7 @@ class Database(Generic[N, L, V, I]):
                         node_mapping,
                         variable_mapping,
                         seen_results,
+                        excluded_subgraphs,
                         seen_graphs,
                     )
             except _SearchTimeout:
@@ -1443,6 +1485,7 @@ class Database(Generic[N, L, V, I]):
                         fallback_match[0],
                         fallback_match[1],
                         seen_results,
+                        excluded_subgraphs,
                         seen_graphs,
                     )
         else:
@@ -1476,6 +1519,7 @@ class Database(Generic[N, L, V, I]):
                     match[0],
                     match[1],
                     seen_results,
+                    excluded_subgraphs,
                     seen_graphs,
                 )
 
@@ -1523,12 +1567,17 @@ class Database(Generic[N, L, V, I]):
         node_mapping: CanonicalNodeMapping[N],
         variable_mapping: CanonicalVariableMapping[V],
         seen_results: set[tuple[int, frozenset[N], I]],
+        excluded_subgraphs: set[frozenset[N]],
         seen_graphs: set[int] | None = None,
     ) -> Iterator[MatchResult[N, V, I]]:
         stored = self._graphs[graph_index]
         matched_query_nodes = frozenset(node_mapping.values())
+        if matched_query_nodes in excluded_subgraphs:
+            return
 
         for ident, witness in self._idents[graph_index].items():
+            if matched_query_nodes in excluded_subgraphs:
+                return
             signature = (graph_index, matched_query_nodes, ident)
             if signature in seen_results:
                 continue
@@ -1852,6 +1901,7 @@ class Database(Generic[N, L, V, I]):
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
         seen_results: set[tuple[int, frozenset[N], I]],
+        excluded_subgraphs: set[frozenset[N]],
         candidate_plan: list[tuple[N, frozenset[int]]] | None = None,
         allow_timeout_fallback: bool = True,
         use_native_budget: bool = True,
@@ -1871,6 +1921,7 @@ class Database(Generic[N, L, V, I]):
                 matched_query_nodes,
                 used_query_nodes,
                 seen_results,
+                excluded_subgraphs,
                 candidate_plan,
                 allow_timeout_fallback,
                 use_native_budget,
@@ -1907,6 +1958,7 @@ class Database(Generic[N, L, V, I]):
                             target_to_query,
                             self._variable_mapping(stored, query_data, matched_query_nodes),
                             seen_results,
+                            excluded_subgraphs,
                         )
                         if first_match_only:
                             eligible.discard(graph_index)
@@ -1943,6 +1995,7 @@ class Database(Generic[N, L, V, I]):
                         matched_query_nodes,
                         used_query_nodes,
                         seen_results,
+                        excluded_subgraphs,
                         child_candidates,
                         allow_timeout_fallback,
                         use_native_budget,
@@ -1961,6 +2014,7 @@ class Database(Generic[N, L, V, I]):
         matched_query_nodes: list[N],
         used_query_nodes: set[N],
         seen_results: set[tuple[int, frozenset[N], I]],
+        excluded_subgraphs: set[frozenset[N]],
         candidate_plan: list[tuple[N, frozenset[int]]] | None = None,
         allow_timeout_fallback: bool = True,
         use_native_budget: bool = True,
@@ -1996,6 +2050,7 @@ class Database(Generic[N, L, V, I]):
                     node_mapping,
                     variable_mapping,
                     seen_results,
+                    excluded_subgraphs,
                 )
                 if first_match_only:
                     eligible.discard(graph_index)
@@ -2008,6 +2063,7 @@ class Database(Generic[N, L, V, I]):
                     fallback_match[0],
                     fallback_match[1],
                     seen_results,
+                    excluded_subgraphs,
                 )
                 if first_match_only:
                     eligible.discard(graph_index)
