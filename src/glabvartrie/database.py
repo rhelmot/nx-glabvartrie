@@ -43,6 +43,10 @@ def _default_node_order_key(node: Hashable) -> Any:
     return node
 
 
+def _default_label_matches(left: Any, right: Any) -> bool:
+    return left == right
+
+
 class QuerySession(Generic[N, V, I], Iterator[MatchResult[N, V, I]]):
     def __init__(
         self,
@@ -659,6 +663,8 @@ class _QueryData(Generic[N, L, V]):
     variables: dict[N, Variables[V]]
     constant_nodes: dict[L, frozenset[N]]
     constant_masks: dict[L, int]
+    matching_constant_nodes_cache: dict[L, frozenset[N]]
+    matching_constant_masks_cache: dict[L, int]
     variable_identifier_nodes: dict[tuple[VariableClass, V], frozenset[N]]
     variable_identifier_masks: dict[tuple[VariableClass, V], int]
     predecessors: dict[N, AbstractSet[N]]
@@ -725,6 +731,8 @@ def _build_query_data(
         variables=variables,
         constant_nodes={identifier: frozenset(nodes) for identifier, nodes in constant_nodes_mut.items()},
         constant_masks={identifier: mask_for_nodes(nodes) for identifier, nodes in constant_nodes_mut.items()},
+        matching_constant_nodes_cache={},
+        matching_constant_masks_cache={},
         variable_identifier_nodes={
             key: frozenset(nodes)
             for key, nodes in variable_identifier_nodes_mut.items()
@@ -760,10 +768,13 @@ class Database(Generic[N, L, V, I]):
         node_label: Callable[[dict[str, Any]], L],
         node_vars: Callable[[dict[str, Any]], Variables[V]],
         node_order_key: Callable[[N], Any] | None = None,
+        label_matches: Callable[[L, L], bool] | None = None,
     ):
         self._node_label = node_label
         self._node_vars = node_vars
         self._node_order_key = node_order_key or _default_node_order_key  # type: ignore[assignment]
+        self._label_matches = label_matches or _default_label_matches
+        self._default_label_matches = label_matches is None or label_matches is _default_label_matches
         self._graphs: dict[int, _StoredGraph[N, L, V]] = {}
         self._idents: dict[int, dict[I, _IdentifierWitness[N, V]]] = {}
         self._ident_to_graph_index: dict[I, int] = {}
@@ -893,6 +904,49 @@ class Database(Generic[N, L, V, I]):
                 for variable_class, identifier_mapping in canonical_to_witness_variables.items()
             },
         )
+
+    def _labels_match(self, target_label: L, query_label: L) -> bool:
+        return self._label_matches(target_label, query_label)
+
+    def _matching_constant_nodes(
+        self,
+        target_label: L,
+        query_data: _QueryData[N, L, V],
+    ) -> frozenset[N]:
+        if self._default_label_matches:
+            return query_data.constant_nodes.get(target_label, frozenset())
+
+        cached = query_data.matching_constant_nodes_cache.get(target_label)
+        if cached is not None:
+            return cached
+
+        matches = frozenset(
+            query_node
+            for query_label, nodes in query_data.constant_nodes.items()
+            if self._labels_match(target_label, query_label)
+            for query_node in nodes
+        )
+        query_data.matching_constant_nodes_cache[target_label] = matches
+        return matches
+
+    def _matching_constant_mask(
+        self,
+        target_label: L,
+        query_data: _QueryData[N, L, V],
+    ) -> int:
+        if self._default_label_matches:
+            return query_data.constant_masks.get(target_label, 0)
+
+        cached = query_data.matching_constant_masks_cache.get(target_label)
+        if cached is not None:
+            return cached
+
+        mask = 0
+        for query_label, label_mask in query_data.constant_masks.items():
+            if self._labels_match(target_label, query_label):
+                mask |= label_mask
+        query_data.matching_constant_masks_cache[target_label] = mask
+        return mask
 
     def _native_budget(self, stored: _StoredGraph[N, L, V]) -> _OperationBudget | None:
         if stored.graph.number_of_nodes() < 50:
@@ -2078,7 +2132,7 @@ class Database(Generic[N, L, V, I]):
         used_query_identifiers: defaultdict[VariableClass, set[V]] = defaultdict(set)
 
         for target_node, query_node in target_to_query.items():
-            if stored.labels[target_node] != query_data.labels[query_node]:
+            if not self._labels_match(stored.labels[target_node], query_data.labels[query_node]):
                 raise ValueError("Matched node labels disagree")
             target_variables = stored.variables[target_node]
             query_variables = query_data.variables[query_node]
@@ -2355,7 +2409,7 @@ class Database(Generic[N, L, V, I]):
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> int:
         del used_query_identifiers
-        mask = query_data.constant_masks.get(stored.labels[target_node], 0)
+        mask = self._matching_constant_mask(stored.labels[target_node], query_data)
         if not mask:
             return 0
         for variable_class, target_identifier in enumerate(stored.variables[target_node]):
@@ -3473,7 +3527,7 @@ class Database(Generic[N, L, V, I]):
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> frozenset[N]:
         del used_query_identifiers
-        candidates = query_data.constant_nodes.get(stored.labels[target_node], frozenset())
+        candidates = self._matching_constant_nodes(stored.labels[target_node], query_data)
         for variable_class, target_identifier in enumerate(stored.variables[target_node]):
             existing = target_var_to_query_identifier.get(variable_class, {}).get(target_identifier)
             if existing is None:
@@ -3493,7 +3547,7 @@ class Database(Generic[N, L, V, I]):
         used_query_identifiers: dict[VariableClass, set[V]],
     ) -> bool:
         del used_query_identifiers
-        if stored.labels[target_node] != query_data.labels[query_node]:
+        if not self._labels_match(stored.labels[target_node], query_data.labels[query_node]):
             return False
         target_variables = stored.variables[target_node]
         query_variables = query_data.variables[query_node]
@@ -3998,7 +4052,7 @@ class Database(Generic[N, L, V, I]):
         matched_query_nodes: list[N],
         query_data: _QueryData[N, L, V],
     ) -> frozenset[N]:
-        candidates = query_data.constant_nodes.get(label_pattern.node_label, frozenset())
+        candidates = self._matching_constant_nodes(label_pattern.node_label, query_data)
         for variable_class, repeated_from in enumerate(label_pattern.repeated_from):
             if repeated_from is None or repeated_from >= len(matched_query_nodes):
                 continue
@@ -4019,7 +4073,7 @@ class Database(Generic[N, L, V, I]):
         query_data: _QueryData[N, L, V],
         candidate: N,
     ) -> bool:
-        if query_data.labels[candidate] != label_pattern.node_label:
+        if not self._labels_match(label_pattern.node_label, query_data.labels[candidate]):
             return False
         candidate_variables = query_data.variables[candidate]
         if len(candidate_variables) != len(label_pattern.repeated_from):
@@ -4059,7 +4113,7 @@ class Database(Generic[N, L, V, I]):
         kind, required_label, variable_count, required_identifiers = requirement
         if kind != "label":
             return False
-        if query_data.labels[query_node] != required_label:
+        if not self._labels_match(required_label, query_data.labels[query_node]):
             return False
         query_variables = query_data.variables[query_node]
         if len(query_variables) != variable_count:
@@ -4136,7 +4190,7 @@ class Database(Generic[N, L, V, I]):
             return False
 
         for constant_identifier, count in stored.constant_counts.items():
-            if count > query_data.constant_counts[constant_identifier]:
+            if count > len(self._matching_constant_nodes(constant_identifier, query_data)):
                 return False
 
         for variable_class, target_sizes in stored.variable_group_sizes.items():
@@ -4147,7 +4201,7 @@ class Database(Generic[N, L, V, I]):
         for target_node, target_label in stored.labels.items():
             target_in_degree = stored.in_degrees[target_node]
             target_out_degree = stored.out_degrees[target_node]
-            candidates = query_data.constant_nodes.get(target_label, frozenset())
+            candidates = self._matching_constant_nodes(target_label, query_data)
 
             if not any(
                 query_data.in_degrees[query_node] >= target_in_degree
@@ -4168,7 +4222,7 @@ class Database(Generic[N, L, V, I]):
         variable_mapping: defaultdict[VariableClass, dict[CanonicalVariable, V]] = defaultdict(dict)
 
         for target_node, query_node in zip(stored.order, matched_query_nodes, strict=True):
-            if stored.labels[target_node] != query_data.labels[query_node]:
+            if not self._labels_match(stored.labels[target_node], query_data.labels[query_node]):
                 raise ValueError("Matched node labels disagree")
             target_variables = stored.variables[target_node]
             query_variables = query_data.variables[query_node]

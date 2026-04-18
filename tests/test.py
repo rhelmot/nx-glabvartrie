@@ -528,6 +528,32 @@ class TestUnits(unittest.TestCase):
         assert found_var_mapping == {}
         assert found_node_mapping == {source: query_source, target: query_target}
 
+    def test_query_label_wildcard(self):
+        d = Database(
+            node_label=lambda attrs: attrs['label'],
+            node_vars=lambda attrs: attrs['vars'],
+            label_matches=lambda target_label, query_label: query_label == "*" or target_label == query_label,
+        )
+
+        target = nx.DiGraph()
+        target.add_node(0, label="red", vars=())
+        target.add_node(1, label="blue", vars=())
+        target.add_edge(0, 1)
+        d.index(target, 10)
+
+        query = nx.DiGraph()
+        query.add_node(100, label="*", vars=())
+        query.add_node(101, label="blue", vars=())
+        query.add_edge(100, 101)
+
+        result = list(d.query(query))
+
+        assert len(result) == 1
+        found_node_mapping, found_var_mapping, found_ident = result[0]
+        assert found_ident == 10
+        assert found_var_mapping == {}
+        assert found_node_mapping == {0: 100, 1: 101}
+
 
 FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
 FUZZ_OFFSET = int(os.environ.get("FUZZ_OFFSET", 0))
