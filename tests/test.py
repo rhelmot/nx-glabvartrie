@@ -524,6 +524,37 @@ class TestUnits(unittest.TestCase):
         assert session.is_valid_expansion({11, 12, 13}, valid_supergraph)
         assert not session.is_valid_expansion({11, 12, 13}, invalid_supergraph)
 
+    def test_sort_index_orders_exact_results(self):
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+
+        small = nx.DiGraph()
+        small.add_node(1, label=None, vars=())
+        small.add_node(2, label=None, vars=())
+        small.add_edge(1, 2)
+        d.index(small, 1)
+
+        large = nx.DiGraph()
+        large.add_node(10, label=None, vars=())
+        large.add_node(11, label=None, vars=())
+        large.add_node(12, label=None, vars=())
+        large.add_edge(10, 11)
+        large.add_edge(11, 12)
+        d.index(large, 2)
+
+        d.sort_index(lambda graph: (-graph.number_of_nodes(), -graph.number_of_edges()))
+
+        query = nx.DiGraph()
+        query.add_node(100, label=None, vars=())
+        query.add_node(101, label=None, vars=())
+        query.add_node(102, label=None, vars=())
+        query.add_edge(100, 101)
+        query.add_edge(101, 102)
+
+        result = list(d.query(query))
+
+        assert result[0][2] == 2
+        assert len(result[0][0]) == 3
+
     def test_unsortable_nodes_with_node_order_key(self):
         class Node:
             def __init__(self, key: int):

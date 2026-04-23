@@ -815,6 +815,8 @@ class Database(Generic[N, L, V, I]):
         self._graphs: dict[int, _StoredGraph[N, L, V]] = {}
         self._idents: dict[int, dict[I, _IdentifierWitness[N, V]]] = {}
         self._ident_to_graph_index: dict[I, int] = {}
+        self._graph_order: list[int] = []
+        self._graph_order_rank: dict[int, int] = {}
         self._next_graph_index = 0
         self._canonical_buckets: defaultdict[tuple[Any, ...], list[int]] = defaultdict(list)
         self._root = _TrieNode(depth=0, topology_pattern=None)
@@ -826,6 +828,18 @@ class Database(Generic[N, L, V, I]):
         self._anchored_ops = _env_int("GLABVARTRIE_ANCHORED_OPS", 6_000_000)
         self._z3_rlimit = _env_int("GLABVARTRIE_Z3_RLIMIT", 5_000_000)
         self._ortools_deterministic_time = _env_float("GLABVARTRIE_ORTOOLS_DETERMINISTIC_TIME", 0.2)
+
+    def sort_index(self, key: Callable[[nx.DiGraph[N]], Any]) -> None:
+        self._graph_order.sort(
+            key=lambda graph_index: (
+                key(self._graphs[graph_index].witness_graph),
+                self._graph_order_rank[graph_index],
+            ),
+        )
+        self._graph_order_rank = {
+            graph_index: rank
+            for rank, graph_index in enumerate(self._graph_order)
+        }
 
     def rename_identifiers(self, mapping: Mapping[I, I]) -> None:
         old_identifiers = {
@@ -918,6 +932,15 @@ class Database(Generic[N, L, V, I]):
 
         stored = self._graphs.pop(graph_index)
         del self._idents[graph_index]
+        self._graph_order = [
+            ordered_graph_index
+            for ordered_graph_index in self._graph_order
+            if ordered_graph_index != graph_index
+        ]
+        self._graph_order_rank = {
+            ordered_graph_index: rank
+            for rank, ordered_graph_index in enumerate(self._graph_order)
+        }
         bucket_key = self._canonical_bucket_key(stored)
         bucket = self._canonical_buckets[bucket_key]
         self._canonical_buckets[bucket_key] = [
@@ -1249,6 +1272,8 @@ class Database(Generic[N, L, V, I]):
         self._idents[graph_index] = {ident: identifier_witness}
         self._ident_to_graph_index[ident] = graph_index
         self._canonical_buckets[bucket_key].append(graph_index)
+        self._graph_order.append(graph_index)
+        self._graph_order_rank[graph_index] = len(self._graph_order) - 1
 
         node = self._root
         node.descendant_graph_indices.add(graph_index)
@@ -1425,13 +1450,7 @@ class Database(Generic[N, L, V, I]):
     ) -> Iterator[_SessionMatch[N, V, I]]:
         remaining = set(eligible)
 
-        graph_order = sorted(
-            remaining,
-            key=lambda graph_index: (
-                self._direct_graph_priority(self._graphs[graph_index], query_data),
-                graph_index,
-            ),
-        )
+        graph_order = self._ordered_graph_indices(remaining)
         for graph_index in graph_order:
             if graph_index not in remaining:
                 continue
@@ -1533,6 +1552,13 @@ class Database(Generic[N, L, V, I]):
             -(stored.in_degrees[root_target] + stored.out_degrees[root_target]),
             root_target,
         )
+
+    def _ordered_graph_indices(self, eligible: set[int]) -> list[int]:
+        return [
+            graph_index
+            for graph_index in self._graph_order
+            if graph_index in eligible
+        ]
 
     def _collect_single_graph_matches(
         self,
