@@ -47,28 +47,65 @@ def _default_label_matches(left: Any, right: Any) -> bool:
     return left == right
 
 
+@dataclass(frozen=True, slots=True)
+class _SessionMatch(Generic[N, V, I]):
+    public_result: MatchResult[N, V, I]
+    graph_index: int
+    witness_node_mapping: NodeMapping[N]
+
+
 class QuerySession(Generic[N, V, I], Iterator[MatchResult[N, V, I]]):
     def __init__(
         self,
-        iterator: Iterator[MatchResult[N, V, I]],
+        iterator: Iterator[_SessionMatch[N, V, I]],
         excluded_subgraphs: set[frozenset[N]],
+        query_graph: nx.DiGraph[N],
+        expansion_validator: Callable[
+            [nx.DiGraph[N], _SessionMatch[N, V, I], frozenset[N], nx.DiGraph[N], dict[int, dict[frozenset[N], NodeMapping[N]]], dict[int, set[frozenset[N]]]],
+            bool,
+        ] | None = None,
     ) -> None:
         self._iterator = iterator
         self._excluded_subgraphs = excluded_subgraphs
+        self._query_graph = query_graph
         self._previous_subgraph: frozenset[N] | None = None
+        self._previous_match: _SessionMatch[N, V, I] | None = None
+        self._expansion_validator = expansion_validator
+        self._positive_expansion_cache: dict[int, dict[frozenset[N], NodeMapping[N]]] = {}
+        self._negative_expansion_cache: dict[int, set[frozenset[N]]] = {}
 
     def __iter__(self) -> QuerySession[N, V, I]:
         return self
 
     def __next__(self) -> MatchResult[N, V, I]:
-        result = next(self._iterator)
-        self._previous_subgraph = frozenset(result[0].values())
-        return result
+        session_match = next(self._iterator)
+        self._previous_match = session_match
+        self._previous_subgraph = frozenset(session_match.public_result[0].values())
+        self._positive_expansion_cache.clear()
+        self._negative_expansion_cache.clear()
+        return session_match.public_result
 
     def exclude_previous_subgraph(self) -> None:
         if self._previous_subgraph is None:
             raise RuntimeError("No previous query result is available to exclude")
         self._excluded_subgraphs.add(self._previous_subgraph)
+
+    def is_valid_expansion(self, nodes: AbstractSet[N], graph: nx.DiGraph[N]) -> bool:
+        if self._previous_match is None or self._previous_subgraph is None:
+            raise RuntimeError("No previous query result is available to expand")
+        query_nodes = frozenset(nodes)
+        if not self._previous_subgraph <= query_nodes:
+            return False
+        if self._expansion_validator is None:
+            raise RuntimeError("This query session does not support expansion validation")
+        return self._expansion_validator(
+            self._query_graph,
+            self._previous_match,
+            query_nodes,
+            graph,
+            self._positive_expansion_cache,
+            self._negative_expansion_cache,
+        )
 
 
 def _env_enabled(name: str, default: bool) -> bool:
@@ -1241,16 +1278,25 @@ class Database(Generic[N, L, V, I]):
             if self._can_match(stored, query_data)
         }
         if not eligible:
-            return QuerySession(iter(()), excluded_subgraphs)
+            return QuerySession(
+                iter(()),
+                excluded_subgraphs,
+                g,
+                self._is_valid_expansion,
+            )
 
         if best_effort:
             return QuerySession(
                 self._query_best_effort(query_data, eligible, excluded_subgraphs),
                 excluded_subgraphs,
+                g,
+                self._is_valid_expansion,
             )
         return QuerySession(
             self._query_exact(query_data, eligible, excluded_subgraphs),
             excluded_subgraphs,
+            g,
+            self._is_valid_expansion,
         )
 
     def query_best_effort(self, g: nx.DiGraph[N]) -> QuerySession[N, V, I]:
@@ -1261,7 +1307,7 @@ class Database(Generic[N, L, V, I]):
         query_data: _QueryData[N, L, V],
         eligible: set[int],
         excluded_subgraphs: set[frozenset[N]],
-    ) -> Iterator[MatchResult[N, V, I]]:
+    ) -> Iterator[_SessionMatch[N, V, I]]:
         seen_results: set[tuple[int, frozenset[N], I]] = set()
         yield from self._query_direct(
             query_data,
@@ -1277,7 +1323,7 @@ class Database(Generic[N, L, V, I]):
         query_data: _QueryData[N, L, V],
         eligible: set[int],
         excluded_subgraphs: set[frozenset[N]],
-    ) -> Iterator[MatchResult[N, V, I]]:
+    ) -> Iterator[_SessionMatch[N, V, I]]:
         seen_results: set[tuple[int, frozenset[N], I]] = set()
         seen_graphs: set[int] = set()
         yield from self._query_direct_first_matches(
@@ -1346,7 +1392,7 @@ class Database(Generic[N, L, V, I]):
         excluded_subgraphs: set[frozenset[N]],
         seen_graphs: set[int],
         first_match_budget_ops: int,
-    ) -> Iterator[MatchResult[N, V, I]]:
+    ) -> Iterator[_SessionMatch[N, V, I]]:
         graph_order = sorted(
             eligible,
             key=lambda graph_index: (
@@ -1376,7 +1422,7 @@ class Database(Generic[N, L, V, I]):
         excluded_subgraphs: set[frozenset[N]],
         allow_timeout_fallback: bool = True,
         use_native_budget: bool = True,
-    ) -> Iterator[MatchResult[N, V, I]]:
+    ) -> Iterator[_SessionMatch[N, V, I]]:
         remaining = set(eligible)
 
         graph_order = sorted(
@@ -1501,7 +1547,7 @@ class Database(Generic[N, L, V, I]):
         use_native_budget: bool = True,
         first_match_budget_ops: int | None = None,
         seen_graphs: set[int] | None = None,
-    ) -> Iterator[MatchResult[N, V, I]]:
+    ) -> Iterator[_SessionMatch[N, V, I]]:
         if graph_index not in eligible or match_limit <= 0:
             return
             yield
@@ -1623,7 +1669,7 @@ class Database(Generic[N, L, V, I]):
         seen_results: set[tuple[int, frozenset[N], I]],
         excluded_subgraphs: set[frozenset[N]],
         seen_graphs: set[int] | None = None,
-    ) -> Iterator[MatchResult[N, V, I]]:
+    ) -> Iterator[_SessionMatch[N, V, I]]:
         stored = self._graphs[graph_index]
         matched_query_nodes = frozenset(node_mapping.values())
         if matched_query_nodes in excluded_subgraphs:
@@ -1651,7 +1697,98 @@ class Database(Generic[N, L, V, I]):
                     witness_identifier_mapping[canonical_to_witness_identifiers[canonical_identifier]] = query_identifier
                 witness_variable_mapping[variable_class] = witness_identifier_mapping
 
-            yield witness_node_mapping, witness_variable_mapping, ident
+            yield _SessionMatch(
+                public_result=(witness_node_mapping, witness_variable_mapping, ident),
+                graph_index=graph_index,
+                witness_node_mapping=witness_node_mapping,
+            )
+
+    def _is_valid_expansion(
+        self,
+        query_graph: nx.DiGraph[N],
+        previous_match: _SessionMatch[N, V, I],
+        query_nodes: frozenset[N],
+        index_supergraph: nx.DiGraph[N],
+        positive_cache: dict[int, dict[frozenset[N], NodeMapping[N]]],
+        negative_cache: dict[int, set[frozenset[N]]],
+    ) -> bool:
+        graph_key = id(index_supergraph)
+        positives = positive_cache.setdefault(graph_key, {})
+        negatives = negative_cache.setdefault(graph_key, set())
+
+        base_mapping = previous_match.witness_node_mapping
+        base_query_nodes = frozenset(base_mapping.values())
+        positives.setdefault(base_query_nodes, dict(base_mapping))
+
+        if not all(node in index_supergraph for node in base_mapping):
+            negatives.add(query_nodes)
+            return False
+        if not base_query_nodes <= query_nodes:
+            negatives.add(query_nodes)
+            return False
+
+        if query_nodes in positives:
+            return True
+        if query_nodes in negatives or any(cached_nodes <= query_nodes for cached_nodes in negatives):
+            return False
+
+        anchor_mapping = dict(base_mapping)
+        anchor_size = len(anchor_mapping)
+        for cached_nodes, cached_mapping in positives.items():
+            if cached_nodes <= query_nodes and len(cached_nodes) > anchor_size:
+                anchor_mapping = dict(cached_mapping)
+                anchor_size = len(cached_nodes)
+
+        query_subgraph = query_graph.subgraph(query_nodes).copy()
+        assert isinstance(query_subgraph, nx.DiGraph)
+        if query_subgraph.number_of_nodes() != len(query_nodes):
+            negatives.add(query_nodes)
+            return False
+
+        reverse_anchor_mapping = {query_node: super_node for super_node, query_node in anchor_mapping.items()}
+        if len(reverse_anchor_mapping) != len(anchor_mapping):
+            negatives.add(query_nodes)
+            return False
+
+        database = self
+
+        class _ExpansionMatcher(DiGraphMatcher):
+            def semantic_feasibility(self, G1_node: N, G2_node: N) -> bool:
+                required_query = anchor_mapping.get(G1_node)
+                if required_query is not None and required_query != G2_node:
+                    return False
+                required_super = reverse_anchor_mapping.get(G2_node)
+                if required_super is not None and required_super != G1_node:
+                    return False
+
+                super_label = database._node_label(index_supergraph.nodes[G1_node])
+                query_label = database._node_label(query_subgraph.nodes[G2_node])
+                if not database._labels_match(super_label, query_label):
+                    return False
+
+                super_vars = database._node_vars(index_supergraph.nodes[G1_node])
+                query_vars = database._node_vars(query_subgraph.nodes[G2_node])
+                if len(super_vars) != len(query_vars):
+                    return False
+
+                for matched_super, matched_query in self.core_1.items():
+                    matched_super_vars = database._node_vars(index_supergraph.nodes[matched_super])
+                    matched_query_vars = database._node_vars(query_subgraph.nodes[matched_query])
+                    for variable_class, super_identifier in enumerate(super_vars):
+                        if matched_super_vars[variable_class] == super_identifier and matched_query_vars[variable_class] != query_vars[variable_class]:
+                            return False
+
+                return True
+
+        matcher = _ExpansionMatcher(index_supergraph, query_subgraph)
+        for mapping in matcher.subgraph_isomorphisms_iter():
+            if any(mapping.get(super_node) != query_node for super_node, query_node in anchor_mapping.items()):
+                continue
+            positives[query_nodes] = dict(mapping)
+            return True
+
+        negatives.add(query_nodes)
+        return False
 
     def _timeout_fallback_match(
         self,
@@ -1960,7 +2097,7 @@ class Database(Generic[N, L, V, I]):
         allow_timeout_fallback: bool = True,
         use_native_budget: bool = True,
         first_match_only: bool = False,
-    ) -> Iterator[MatchResult[N, V, I]]:
+    ) -> Iterator[_SessionMatch[N, V, I]]:
         active_graphs = node.descendant_graph_indices & eligible
         if not active_graphs or node.topology_pattern is None:
             return
@@ -2073,7 +2210,7 @@ class Database(Generic[N, L, V, I]):
         allow_timeout_fallback: bool = True,
         use_native_budget: bool = True,
         first_match_only: bool = False,
-    ) -> Iterator[MatchResult[N, V, I]]:
+    ) -> Iterator[_SessionMatch[N, V, I]]:
         del position
         del candidate_plan
 

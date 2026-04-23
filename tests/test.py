@@ -488,6 +488,42 @@ class TestUnits(unittest.TestCase):
 
         assert list(session) == []
 
+    def test_query_session_valid_expansion(self):
+        d = Database(node_label=lambda attrs: attrs['label'], node_vars=lambda attrs: attrs['vars'])
+
+        indexed = nx.DiGraph()
+        indexed.add_node(1, label="a", vars=(0,))
+        indexed.add_node(2, label="b", vars=(1,))
+        indexed.add_edge(1, 2)
+        d.index(indexed, 10)
+
+        query = nx.DiGraph()
+        query.add_node(11, label="a", vars=(100,))
+        query.add_node(12, label="b", vars=(101,))
+        query.add_node(13, label="c", vars=(102,))
+        query.add_edge(11, 12)
+        query.add_edge(12, 13)
+
+        session = d.query(query)
+        first_match = next(session)
+        assert first_match[2] == 10
+        assert first_match[0] == {1: 11, 2: 12}
+
+        valid_supergraph = nx.DiGraph()
+        valid_supergraph.add_node(1, label="a", vars=(0,))
+        valid_supergraph.add_node(2, label="b", vars=(1,))
+        valid_supergraph.add_node(3, label="c", vars=(2,))
+        valid_supergraph.add_edge(1, 2)
+        valid_supergraph.add_edge(2, 3)
+
+        invalid_supergraph = valid_supergraph.copy()
+        assert isinstance(invalid_supergraph, nx.DiGraph)
+        invalid_supergraph.add_edge(1, 3)
+
+        assert session.is_valid_expansion({11, 12, 13}, valid_supergraph)
+        assert session.is_valid_expansion({11, 12, 13}, valid_supergraph)
+        assert not session.is_valid_expansion({11, 12, 13}, invalid_supergraph)
+
     def test_unsortable_nodes_with_node_order_key(self):
         class Node:
             def __init__(self, key: int):
