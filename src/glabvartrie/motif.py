@@ -324,6 +324,12 @@ class MotifFinder(Generic[N, L, V, I]):
             )
         return tuple(sorted(node_signatures))
 
-    def motifs(self, size: int) -> Iterator[list[tuple[I, tuple[N, ...]]]]:
-        for motif_class in self._motifs_by_size.get(size, ()):
-            yield list(motif_class)
+    def motifs(self, size: int | None = None, *, descending: bool = False) -> Iterator[list[tuple[I, tuple[N, ...]]]]:
+        if size is not None:
+            for motif_class in self._motifs_by_size.get(size, ()):
+                yield list(motif_class)
+            return
+
+        for current_size in sorted(self._motifs_by_size, reverse=descending):
+            for motif_class in self._motifs_by_size[current_size]:
+                yield list(motif_class)

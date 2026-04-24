@@ -107,6 +107,40 @@ def generate_and_test_corpus(r: Random, graph_generator: Callable[[Random], nx.D
                 pass
         assert not wanted_motifs, f"We missed {len(wanted_motifs)} embedded motif(s) of size {motif_size}"
 
+class TestUnits(unittest.TestCase):
+    def test_motifs_all_sizes_ordering(self):
+        graph = nx.DiGraph()
+        graph.add_node(0, label=0, vars=())
+        graph.add_node(1, label=1, vars=())
+        graph.add_node(2, label=2, vars=())
+        graph.add_edge(0, 1)
+        graph.add_edge(1, 2)
+
+        finder: MotifFinder[int, int, int, int] = MotifFinder(
+            {
+                0: (
+                    graph,
+                    frozenset(
+                        {
+                            frozenset({0}),
+                            frozenset({0, 1}),
+                            frozenset({0, 1, 2}),
+                        }
+                    ),
+                )
+            },
+            node_label,
+            node_vars,
+        )
+
+        ascending = list(finder.motifs())
+        descending = list(finder.motifs(descending=True))
+        only_size_two = list(finder.motifs(2))
+
+        self.assertEqual([len(motif[0][1]) for motif in ascending], [1, 2, 3])
+        self.assertEqual([len(motif[0][1]) for motif in descending], [3, 2, 1])
+        self.assertEqual(len(only_size_two), 1)
+        self.assertEqual(only_size_two[0], [(0, (0, 1))])
 
 class TestFuzz(unittest.TestCase):
     def test_fuzz_small(self):
