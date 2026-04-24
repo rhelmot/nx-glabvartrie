@@ -74,6 +74,7 @@ class MotifSession(Generic[N, L, V, I]):
         self._motif_class = motif_class
         self._occurrences = tuple(motif_class.occurrences)
         self._expansion_cache: dict[tuple[I, frozenset[N], frozenset[N]], MotifSession[N, L, V, I] | None] = {}
+        self._valid_expansion_cache: dict[tuple[I, frozenset[N], frozenset[N]], bool] = {}
 
     def __iter__(self) -> Iterator[tuple[I, tuple[N, ...]]]:
         return iter(self._occurrences)
@@ -102,9 +103,41 @@ class MotifSession(Generic[N, L, V, I]):
         cache_key = (source, witness_nodeset, expanded_nodeset)
         if cache_key in self._expansion_cache:
             return self._expansion_cache[cache_key]
+        cached_valid = self._valid_expansion_cache.get(cache_key)
+        if cached_valid is False:
+            self._expansion_cache[cache_key] = None
+            return None
 
         result = self._finder._expand_motif_class(self._motif_class, source, witness_nodeset, expanded_nodeset)
+        self._valid_expansion_cache[cache_key] = result is not None
         self._expansion_cache[cache_key] = result
+        return result
+
+    def is_valid_expansion(
+        self,
+        witness: tuple[I, Iterable[N]],
+        expanded_nodes: Iterable[N],
+    ) -> bool:
+        source, witness_nodes = witness
+        witness_nodeset = frozenset(witness_nodes)
+        expanded_nodeset = frozenset(expanded_nodes)
+        cache_key = (source, witness_nodeset, expanded_nodeset)
+        cached_expansion = self._expansion_cache.get(cache_key)
+        if cached_expansion is not None:
+            return True
+        if cache_key in self._expansion_cache:
+            return False
+        cached_valid = self._valid_expansion_cache.get(cache_key)
+        if cached_valid is not None:
+            return cached_valid
+
+        result = self._finder._is_valid_motif_expansion(
+            self._motif_class,
+            source,
+            witness_nodeset,
+            expanded_nodeset,
+        )
+        self._valid_expansion_cache[cache_key] = result
         return result
 
 
@@ -586,6 +619,34 @@ class MotifFinder(Generic[N, L, V, I]):
         if not expanded_motif_class.occurrences:
             return None
         return MotifSession(self, expanded_motif_class)
+
+    def _is_valid_motif_expansion(
+        self,
+        motif_class: _MotifClass[N, I],
+        source: I,
+        witness_nodeset: frozenset[N],
+        expanded_nodeset: frozenset[N],
+    ) -> bool:
+        witness_key = (source, witness_nodeset)
+        if witness_key not in motif_class.occurrence_mappings:
+            raise ValueError("witness is not an occurrence of this motif")
+        if not witness_nodeset.issubset(expanded_nodeset):
+            raise ValueError("expanded nodes must be a superset of the witness")
+
+        representative_base_order = motif_class.representative_order
+        origin_base_order = motif_class.occurrence_mappings[witness_key]
+        representative_expanded_order = self._expanded_order(source, origin_base_order, expanded_nodeset)
+        representative_graph = self._parents[source].graph.subgraph(expanded_nodeset)
+        assert isinstance(representative_graph, nx.DiGraph)
+
+        mapping = self._find_anchored_expansion(
+            representative_graph,
+            representative_expanded_order,
+            len(representative_base_order),
+            self._parents[source].graph,
+            origin_base_order,
+        )
+        return mapping is not None
 
     def motifs(self, size: int | None = None, *, descending: bool = False) -> Iterator[MotifSession[N, L, V, I]]:
         if size is not None:

@@ -108,6 +108,47 @@ def generate_and_test_corpus(r: Random, graph_generator: Callable[[Random], nx.D
         assert not wanted_motifs, f"We missed {len(wanted_motifs)} embedded motif(s) of size {motif_size}"
 
 class TestUnits(unittest.TestCase):
+    def test_is_valid_expansion_supports_chaining(self):
+        g0 = nx.DiGraph()
+        for node, label in enumerate(range(5)):
+            g0.add_node(node, label=label, vars=())
+        g0.add_edges_from([(0, 1), (1, 2), (1, 3), (2, 3), (3, 4)])
+
+        g1 = nx.DiGraph()
+        for node, label in zip((10, 11, 12, 13, 14), range(5)):
+            g1.add_node(node, label=label, vars=())
+        g1.add_edges_from([(10, 11), (11, 12), (11, 13), (12, 13), (13, 14)])
+
+        finder: MotifFinder[int, int, int, int] = MotifFinder(
+            {
+                0: (g0, frozenset({frozenset({0, 1, 2})})),
+                1: (g1, frozenset({frozenset({10, 11, 12})})),
+            },
+            node_label,
+            node_vars,
+        )
+
+        session3 = next(finder.motifs(3))
+        self.assertTrue(session3.is_valid_expansion((0, {0, 1, 2}), {0, 1, 2, 3}))
+        with self.assertRaises(ValueError):
+            session3.is_valid_expansion((0, {0, 1, 2}), {0, 1})
+
+        session4 = session3.expand_from((0, {0, 1, 2}), {0, 1, 2, 3})
+        self.assertIsNotNone(session4)
+        assert session4 is not None
+        self.assertTrue(session4.is_valid_expansion((0, {0, 1, 2, 3}), {0, 1, 2, 3, 4}))
+
+        session5 = session4.expand_from((0, {0, 1, 2, 3}), {0, 1, 2, 3, 4})
+        self.assertIsNotNone(session5)
+        assert session5 is not None
+        self.assertEqual(
+            list(session5),
+            [
+                (0, (0, 1, 2, 3, 4)),
+                (1, (10, 11, 12, 13, 14)),
+            ],
+        )
+
     def test_expand_unindexed_motif(self):
         g0 = nx.DiGraph()
         g0.add_node(0, label=0, vars=())
