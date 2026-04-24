@@ -85,6 +85,67 @@ def graphs_are_isomorphic(
     return _Matcher(g1, g2).is_isomorphic()
 
 
+def graph_isomorphism_mapping(
+    g1: nx.DiGraph[N],
+    g2: nx.DiGraph[N],
+    node_label: Callable[[dict[str, Any]], L],
+    node_vars: Callable[[dict[str, Any]], tuple[V, ...]],
+    label_matches: Callable[[L, L], bool] | None = None,
+) -> dict[N, N] | None:
+    if g1.number_of_nodes() != g2.number_of_nodes():
+        return None
+    if g1.number_of_edges() != g2.number_of_edges():
+        return None
+
+    match_labels = label_matches or _default_label_matches
+    g1_labels = {node: node_label(g1.nodes[node]) for node in g1.nodes}
+    g2_labels = {node: node_label(g2.nodes[node]) for node in g2.nodes}
+    g1_vars = {node: node_vars(g1.nodes[node]) for node in g1.nodes}
+    g2_vars = {node: node_vars(g2.nodes[node]) for node in g2.nodes}
+
+    class _Matcher(DiGraphMatcher):
+        def semantic_feasibility(self, G1_node: N, G2_node: N) -> bool:
+            if not match_labels(g1_labels[G1_node], g2_labels[G2_node]):
+                return False
+
+            source_vars = g1_vars[G1_node]
+            target_vars = g2_vars[G2_node]
+            if len(source_vars) != len(target_vars):
+                return False
+
+            source_to_target: defaultdict[int, dict[V, V]] = defaultdict(dict)
+            target_to_source: defaultdict[int, dict[V, V]] = defaultdict(dict)
+            for matched_g1, matched_g2 in self.core_1.items():
+                matched_source_vars = g1_vars[matched_g1]
+                matched_target_vars = g2_vars[matched_g2]
+                if len(matched_source_vars) != len(matched_target_vars):
+                    return False
+                for variable_class, source_identifier in enumerate(matched_source_vars):
+                    target_identifier = matched_target_vars[variable_class]
+                    existing_target = source_to_target[variable_class].get(source_identifier)
+                    existing_source = target_to_source[variable_class].get(target_identifier)
+                    if existing_target is not None and existing_target != target_identifier:
+                        return False
+                    if existing_source is not None and existing_source != source_identifier:
+                        return False
+                    source_to_target[variable_class][source_identifier] = target_identifier
+                    target_to_source[variable_class][target_identifier] = source_identifier
+
+            for variable_class, source_identifier in enumerate(source_vars):
+                target_identifier = target_vars[variable_class]
+                existing_target = source_to_target[variable_class].get(source_identifier)
+                existing_source = target_to_source[variable_class].get(target_identifier)
+                if existing_target is not None and existing_target != target_identifier:
+                    return False
+                if existing_source is not None and existing_source != source_identifier:
+                    return False
+
+            return True
+
+    matcher = _Matcher(g1, g2)
+    return next(matcher.isomorphisms_iter(), None)
+
+
 def topologies_are_isomorphic(g1: nx.DiGraph[N], g2: nx.DiGraph[N]) -> bool:
     if g1.number_of_nodes() != g2.number_of_nodes():
         return False
@@ -525,6 +586,7 @@ __all__ = [
     "canonical_labeled_signature",
     "canonicalize_graph",
     "graph_automorphisms",
+    "graph_isomorphism_mapping",
     "graphs_are_isomorphic",
     "label_patterns_for_order",
     "topologies_are_isomorphic",

@@ -108,6 +108,42 @@ def generate_and_test_corpus(r: Random, graph_generator: Callable[[Random], nx.D
         assert not wanted_motifs, f"We missed {len(wanted_motifs)} embedded motif(s) of size {motif_size}"
 
 class TestUnits(unittest.TestCase):
+    def test_expand_unindexed_motif(self):
+        g0 = nx.DiGraph()
+        g0.add_node(0, label=0, vars=())
+        g0.add_node(1, label=1, vars=())
+        g0.add_node(2, label=2, vars=())
+        g0.add_node(3, label=3, vars=())
+        g0.add_edges_from([(0, 1), (1, 2), (1, 3), (2, 3)])
+
+        g1 = nx.DiGraph()
+        g1.add_node(10, label=0, vars=())
+        g1.add_node(11, label=1, vars=())
+        g1.add_node(12, label=2, vars=())
+        g1.add_node(13, label=3, vars=())
+        g1.add_edges_from([(10, 11), (11, 12), (11, 13), (12, 13)])
+
+        finder: MotifFinder[int, int, int, int] = MotifFinder(
+            {
+                0: (g0, frozenset({frozenset({0, 1, 2})})),
+                1: (g1, frozenset({frozenset({10, 11, 12})})),
+            },
+            node_label,
+            node_vars,
+        )
+
+        session = next(finder.motifs(3))
+        expanded = session.expand_from((0, (0, 1, 2)), {0, 1, 2, 3})
+        self.assertIsNotNone(expanded)
+        assert expanded is not None
+        self.assertEqual(
+            list(expanded),
+            [
+                (0, (0, 1, 2, 3)),
+                (1, (10, 11, 12, 13)),
+            ],
+        )
+
     def test_motifs_all_sizes_ordering(self):
         graph = nx.DiGraph()
         graph.add_node(0, label=0, vars=())

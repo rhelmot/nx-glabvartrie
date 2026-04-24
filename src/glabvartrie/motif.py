@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Generic, Hashable
 
@@ -16,6 +16,7 @@ from .common import (
     _default_label_matches,
     _default_node_order_key,
     _stable_value_key,
+    graph_isomorphism_mapping,
     graphs_are_isomorphic,
     topologies_are_isomorphic,
     topology_patterns_for_order,
@@ -31,8 +32,10 @@ class _OccurrenceRef(Generic[N, I]):
 @dataclass(slots=True)
 class _MotifClass(Generic[N, I]):
     representative: _OccurrenceRef[N, I]
+    representative_order: tuple[N, ...]
     occurrences: list[tuple[I, tuple[N, ...]]] = field(default_factory=list)
     occurrence_keys: set[tuple[I, frozenset[N]]] = field(default_factory=set)
+    occurrence_mappings: dict[tuple[I, frozenset[N]], tuple[N, ...]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -55,9 +58,54 @@ class _TopologyClass(Generic[N, I]):
 class _ParentSamples(Generic[N]):
     graph: nx.DiGraph[N]
     nodesets: frozenset[frozenset[N]]
+    nodesets_by_size: dict[int, tuple[frozenset[N], ...]]
     subset_parent_cache: dict[frozenset[N], frozenset[N] | None] = field(default_factory=dict)
     degree_cache: dict[frozenset[N], dict[N, tuple[int, int, bool]]] = field(default_factory=dict)
     subgraph_cache: dict[frozenset[N], nx.DiGraph[N]] = field(default_factory=dict)
+
+
+class MotifSession(Generic[N, L, V, I]):
+    def __init__(
+        self,
+        finder: MotifFinder[N, L, V, I],
+        motif_class: _MotifClass[N, I],
+    ) -> None:
+        self._finder = finder
+        self._motif_class = motif_class
+        self._occurrences = tuple(motif_class.occurrences)
+        self._expansion_cache: dict[tuple[I, frozenset[N], frozenset[N]], MotifSession[N, L, V, I] | None] = {}
+
+    def __iter__(self) -> Iterator[tuple[I, tuple[N, ...]]]:
+        return iter(self._occurrences)
+
+    def __len__(self) -> int:
+        return len(self._occurrences)
+
+    def __getitem__(self, index: int) -> tuple[I, tuple[N, ...]]:
+        return self._occurrences[index]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, MotifSession):
+            return self._occurrences == other._occurrences
+        if isinstance(other, list) or isinstance(other, tuple):
+            return list(self._occurrences) == list(other)
+        return NotImplemented  # type: ignore[return-value]
+
+    def expand_from(
+        self,
+        witness: tuple[I, Iterable[N]],
+        expanded_nodes: Iterable[N],
+    ) -> MotifSession[N, L, V, I] | None:
+        source, witness_nodes = witness
+        witness_nodeset = frozenset(witness_nodes)
+        expanded_nodeset = frozenset(expanded_nodes)
+        cache_key = (source, witness_nodeset, expanded_nodeset)
+        if cache_key in self._expansion_cache:
+            return self._expansion_cache[cache_key]
+
+        result = self._finder._expand_motif_class(self._motif_class, source, witness_nodeset, expanded_nodeset)
+        self._expansion_cache[cache_key] = result
+        return result
 
 
 class MotifFinder(Generic[N, L, V, I]):
@@ -92,7 +140,17 @@ class MotifFinder(Generic[N, L, V, I]):
                 if nodeset
                 and (self._max_motif_size is None or len(nodeset) <= self._max_motif_size)
             )
-            self._parents[source] = _ParentSamples(graph=graph, nodesets=filtered_nodesets)
+            nodesets_by_size_lists: defaultdict[int, list[frozenset[N]]] = defaultdict(list)
+            for nodeset in filtered_nodesets:
+                nodesets_by_size_lists[len(nodeset)].append(nodeset)
+            self._parents[source] = _ParentSamples(
+                graph=graph,
+                nodesets=filtered_nodesets,
+                nodesets_by_size={
+                    size: tuple(nodesets_for_size)
+                    for size, nodesets_for_size in nodesets_by_size_lists.items()
+                },
+            )
             ordered_occurrences.extend(
                 _OccurrenceRef(source=source, nodeset=nodeset)
                 for nodeset in filtered_nodesets
@@ -129,22 +187,28 @@ class MotifFinder(Generic[N, L, V, I]):
             occurrence_nodes = tuple(sorted(occurrence.nodeset, key=self._node_order_key))
             occurrence_key = (occurrence.source, occurrence.nodeset)
             for motif_class in motif_class_bucket:
-                if graphs_are_isomorphic(
+                mapping = graph_isomorphism_mapping(
                     self._subgraph(motif_class.representative),
                     sample_graph,
                     self._node_label,
                     self._node_vars,
                     self._label_matches,
-                ):
+                )
+                if mapping is not None:
                     if occurrence_key not in motif_class.occurrence_keys:
                         motif_class.occurrences.append((occurrence.source, occurrence_nodes))
                         motif_class.occurrence_keys.add(occurrence_key)
+                        motif_class.occurrence_mappings[occurrence_key] = tuple(
+                            mapping[node] for node in motif_class.representative_order
+                        )
                     break
             else:
                 motif_class = _MotifClass(
                     representative=occurrence,
+                    representative_order=occurrence_nodes,
                     occurrences=[(occurrence.source, occurrence_nodes)],
                     occurrence_keys={occurrence_key},
+                    occurrence_mappings={occurrence_key: occurrence_nodes},
                 )
                 motif_class_bucket.append(motif_class)
                 topology_class.motif_classes.append(motif_class)
@@ -153,12 +217,11 @@ class MotifFinder(Generic[N, L, V, I]):
         self._topology_classes_by_size = topology_classes_by_size
         self._trie_built = False
 
-        self._motifs_by_size: dict[int, tuple[tuple[tuple[I, tuple[N, ...]], ...], ...]] = {}
+        self._motifs_by_size: dict[int, tuple[_MotifClass[N, I], ...]] = {}
         for size, motif_classes in self._motif_classes_by_size.items():
-            self._motifs_by_size[size] = tuple(
-                tuple(sorted(motif_class.occurrences, key=lambda occurrence: (_stable_value_key(occurrence[0]), occurrence[1])))
-                for motif_class in motif_classes
-            )
+            for motif_class in motif_classes:
+                motif_class.occurrences.sort(key=lambda occurrence: (_stable_value_key(occurrence[0]), occurrence[1]))
+            self._motifs_by_size[size] = tuple(motif_classes)
 
     def _ensure_trie(self) -> None:
         if self._trie_built:
@@ -324,12 +387,212 @@ class MotifFinder(Generic[N, L, V, I]):
             )
         return tuple(sorted(node_signatures))
 
-    def motifs(self, size: int | None = None, *, descending: bool = False) -> Iterator[list[tuple[I, tuple[N, ...]]]]:
+    def _expanded_order(
+        self,
+        source: I,
+        base_order: tuple[N, ...],
+        expanded_nodeset: frozenset[N],
+    ) -> tuple[N, ...]:
+        graph = self._parents[source].graph
+        base_nodes = frozenset(base_order)
+        extra_nodes = expanded_nodeset - base_nodes
+        extra_signatures: list[tuple[tuple[Any, ...], N]] = []
+        for node in extra_nodes:
+            variables = self._node_vars(graph.nodes[node])
+            local_variable_pattern: dict[V, int] = {}
+            extra_signatures.append(
+                (
+                    (
+                        self._node_label(graph.nodes[node]) if self._default_label_matches else None,
+                        tuple(local_variable_pattern.setdefault(identifier, len(local_variable_pattern)) for identifier in variables),
+                        len(variables),
+                        tuple(int(graph.has_edge(base_node, node)) for base_node in base_order),
+                        tuple(int(graph.has_edge(node, base_node)) for base_node in base_order),
+                        graph.has_edge(node, node),
+                        sum(1 for predecessor in graph.pred[node] if predecessor in expanded_nodeset),
+                        sum(1 for successor in graph.succ[node] if successor in expanded_nodeset),
+                    ),
+                    node,
+                )
+            )
+        ordered_extra = tuple(
+            node
+            for _, node in sorted(
+                extra_signatures,
+                key=lambda item: (item[0], self._node_order_key(item[1])),
+            )
+        )
+        return base_order + ordered_extra
+
+    def _find_anchored_expansion(
+        self,
+        representative_graph: nx.DiGraph[N],
+        representative_order: tuple[N, ...],
+        base_size: int,
+        target_graph: nx.DiGraph[N],
+        target_base_order: tuple[N, ...],
+    ) -> tuple[N, ...] | None:
+        used_targets = set(target_base_order)
+        mapping = {
+            representative_order[position]: target_base_order[position]
+            for position in range(base_size)
+        }
+        source_to_target: defaultdict[int, dict[V, V]] = defaultdict(dict)
+        target_to_source: defaultdict[int, dict[V, V]] = defaultdict(dict)
+
+        def bind_variables(source_node: N, target_node: N) -> bool:
+            source_vars = self._node_vars(representative_graph.nodes[source_node])
+            target_vars = self._node_vars(target_graph.nodes[target_node])
+            if len(source_vars) != len(target_vars):
+                return False
+            for variable_class, source_identifier in enumerate(source_vars):
+                target_identifier = target_vars[variable_class]
+                existing_target = source_to_target[variable_class].get(source_identifier)
+                existing_source = target_to_source[variable_class].get(target_identifier)
+                if existing_target is not None and existing_target != target_identifier:
+                    return False
+                if existing_source is not None and existing_source != source_identifier:
+                    return False
+            for variable_class, source_identifier in enumerate(source_vars):
+                target_identifier = target_vars[variable_class]
+                source_to_target[variable_class][source_identifier] = target_identifier
+                target_to_source[variable_class][target_identifier] = source_identifier
+            return True
+
+        for position in range(base_size):
+            if not bind_variables(representative_order[position], target_base_order[position]):
+                return None
+
+        target_nodes = tuple(target_graph.nodes)
+
+        def search(position: int) -> bool:
+            if position == len(representative_order):
+                return True
+
+            source_node = representative_order[position]
+            source_label = self._node_label(representative_graph.nodes[source_node])
+            source_vars = self._node_vars(representative_graph.nodes[source_node])
+            for candidate in target_nodes:
+                if candidate in used_targets:
+                    continue
+                if not self._label_matches(source_label, self._node_label(target_graph.nodes[candidate])):
+                    continue
+                if len(source_vars) != len(self._node_vars(target_graph.nodes[candidate])):
+                    continue
+                if target_graph.has_edge(candidate, candidate) != representative_graph.has_edge(source_node, source_node):
+                    continue
+
+                for previous_position in range(position):
+                    previous_source = representative_order[previous_position]
+                    previous_target = mapping[previous_source]
+                    if representative_graph.has_edge(previous_source, source_node) != target_graph.has_edge(previous_target, candidate):
+                        break
+                    if representative_graph.has_edge(source_node, previous_source) != target_graph.has_edge(candidate, previous_target):
+                        break
+                else:
+                    snapshot_source = {variable_class: dict(value) for variable_class, value in source_to_target.items()}
+                    snapshot_target = {variable_class: dict(value) for variable_class, value in target_to_source.items()}
+                    if not bind_variables(source_node, candidate):
+                        source_to_target.clear()
+                        target_to_source.clear()
+                        source_to_target.update({variable_class: dict(value) for variable_class, value in snapshot_source.items()})
+                        target_to_source.update({variable_class: dict(value) for variable_class, value in snapshot_target.items()})
+                        continue
+                    mapping[source_node] = candidate
+                    used_targets.add(candidate)
+                    if search(position + 1):
+                        return True
+                    used_targets.remove(candidate)
+                    del mapping[source_node]
+                    source_to_target.clear()
+                    target_to_source.clear()
+                    source_to_target.update({variable_class: dict(value) for variable_class, value in snapshot_source.items()})
+                    target_to_source.update({variable_class: dict(value) for variable_class, value in snapshot_target.items()})
+
+            return False
+
+        if not search(base_size):
+            return None
+        return tuple(mapping[node] for node in representative_order)
+
+    def _expand_motif_class(
+        self,
+        motif_class: _MotifClass[N, I],
+        source: I,
+        witness_nodeset: frozenset[N],
+        expanded_nodeset: frozenset[N],
+    ) -> MotifSession[N, L, V, I] | None:
+        witness_key = (source, witness_nodeset)
+        if witness_key not in motif_class.occurrence_mappings:
+            raise ValueError("witness is not an occurrence of this motif")
+        if not witness_nodeset.issubset(expanded_nodeset):
+            raise ValueError("expanded nodes must be a superset of the witness")
+
+        representative_base_order = motif_class.representative_order
+        origin_base_order = motif_class.occurrence_mappings[witness_key]
+        representative_expanded_order = self._expanded_order(source, origin_base_order, expanded_nodeset)
+        representative_graph = self._parents[source].graph.subgraph(expanded_nodeset)
+        assert isinstance(representative_graph, nx.DiGraph)
+
+        expanded_motif_class = _MotifClass(
+            representative=_OccurrenceRef(source=source, nodeset=expanded_nodeset),
+            representative_order=representative_expanded_order,
+        )
+
+        for occurrence_source, occurrence_nodes in motif_class.occurrences:
+            occurrence_nodeset = frozenset(occurrence_nodes)
+            occurrence_key = (occurrence_source, occurrence_nodeset)
+            base_order = motif_class.occurrence_mappings[occurrence_key]
+            parent = self._parents[occurrence_source]
+
+            sampled_match: tuple[N, ...] | None = None
+            for candidate_nodeset in parent.nodesets_by_size.get(len(expanded_nodeset), ()):
+                if not occurrence_nodeset.issubset(candidate_nodeset):
+                    continue
+                candidate_graph = parent.graph.subgraph(candidate_nodeset)
+                assert isinstance(candidate_graph, nx.DiGraph)
+                mapping = self._find_anchored_expansion(
+                    representative_graph,
+                    representative_expanded_order,
+                    len(representative_base_order),
+                    candidate_graph,
+                    base_order,
+                )
+                if mapping is not None:
+                    sampled_match = mapping
+                    break
+
+            if sampled_match is None:
+                sampled_match = self._find_anchored_expansion(
+                    representative_graph,
+                    representative_expanded_order,
+                    len(representative_base_order),
+                    parent.graph,
+                    base_order,
+                )
+
+            if sampled_match is None:
+                continue
+
+            matched_nodeset = frozenset(sampled_match)
+            occurrence_value = (occurrence_source, tuple(sorted(matched_nodeset, key=self._node_order_key)))
+            occurrence_cache_key = (occurrence_source, matched_nodeset)
+            if occurrence_cache_key in expanded_motif_class.occurrence_keys:
+                continue
+            expanded_motif_class.occurrences.append(occurrence_value)
+            expanded_motif_class.occurrence_keys.add(occurrence_cache_key)
+            expanded_motif_class.occurrence_mappings[occurrence_cache_key] = sampled_match
+
+        if not expanded_motif_class.occurrences:
+            return None
+        return MotifSession(self, expanded_motif_class)
+
+    def motifs(self, size: int | None = None, *, descending: bool = False) -> Iterator[MotifSession[N, L, V, I]]:
         if size is not None:
             for motif_class in self._motifs_by_size.get(size, ()):
-                yield list(motif_class)
+                yield MotifSession(self, motif_class)
             return
 
         for current_size in sorted(self._motifs_by_size, reverse=descending):
             for motif_class in self._motifs_by_size[current_size]:
-                yield list(motif_class)
+                yield MotifSession(self, motif_class)
