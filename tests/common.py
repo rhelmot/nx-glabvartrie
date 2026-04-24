@@ -76,7 +76,7 @@ def embed_graph(query: nx.DiGraph[int], t: nx.DiGraph[int], available_nodes: lis
 def is_isomorphic_match(g1: nx.DiGraph[N], g2: nx.DiGraph[N], node_label: Callable[[dict[str, Any]], L], node_vars: Callable[[dict[str, Any]], tuple[V, ...]], label_matches: Callable[[L, L], bool] | None = None) -> bool:
     return graphs_are_isomorphic(g1, g2, node_label, node_vars, label_matches)
 
-def generate_random_subgraphs(r: Random, g: nx.DiGraph[N], n: int) -> Iterable[nx.DiGraph[N]]:
+def generate_random_subgraph_nodesets(r: Random, g: nx.DiGraph[N], n: int) -> Iterable[frozenset[N]]:
     assert nx.is_weakly_connected(g)
     nodes = tuple(g)
     for _ in range(n):
@@ -105,6 +105,11 @@ def generate_random_subgraphs(r: Random, g: nx.DiGraph[N], n: int) -> Iterable[n
                     continue
                 frontier_set.add(neighbor)
                 frontier.append(neighbor)
-        bweh = g.subgraph(seen)
-        assert isinstance(bweh, nx.DiGraph)
-        yield bweh
+        yield frozenset(seen)
+
+
+def generate_random_subgraphs(r: Random, g: nx.DiGraph[N], n: int) -> Iterable[nx.DiGraph[N]]:
+    for nodeset in generate_random_subgraph_nodesets(r, g, n):
+        subgraph = g.subgraph(nodeset)
+        assert isinstance(subgraph, nx.DiGraph)
+        yield subgraph

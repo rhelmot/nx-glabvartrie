@@ -8,7 +8,13 @@ from random import Random
 import networkx as nx
 
 from glabvartrie import MotifFinder
-from common import CantEmbed, random_connected_graph, embed_graph, is_isomorphic_match, generate_random_subgraphs
+from common import (
+    CantEmbed,
+    embed_graph,
+    generate_random_subgraph_nodesets,
+    is_isomorphic_match,
+    random_connected_graph,
+)
 
 FUZZ_COUNT = int(os.environ.get("FUZZ_COUNT", 100))
 FUZZ_OFFSET = int(os.environ.get("FUZZ_OFFSET", 0))
@@ -45,22 +51,28 @@ def generate_and_test_corpus(r: Random, graph_generator: Callable[[Random], nx.D
                 motif_embeddings[motif_index].append((graph_idx, tuple(sorted(embedding.values()))))
                 break
 
-    to_index: list[tuple[nx.DiGraph[int], int]] = []
+    to_index: dict[int, tuple[nx.DiGraph[int], set[frozenset[int]]]] = {
+        gidx: (g, set())
+        for gidx, (g, _) in enumerate(graphs)
+    }
     for i, (motif, _) in enumerate(motifs):
         for gidx, embedded_nodes in motif_embeddings[i]:
             g = graphs[gidx][0]
-            motif_in_g = g.subgraph(embedded_nodes).copy()
+            motif_nodeset = frozenset(embedded_nodes)
+            to_index[gidx][1].add(motif_nodeset)
+            motif_in_g = g.subgraph(motif_nodeset)
             assert isinstance(motif_in_g, nx.DiGraph)
-            to_index.append((motif_in_g, gidx))
-            for g2 in generate_random_subgraphs(r, motif_in_g, 10):
-                to_index.append((g2, gidx))
+            for nodeset in generate_random_subgraph_nodesets(r, motif_in_g, 10):
+                to_index[gidx][1].add(frozenset(nodeset))
     for gidx, (g, _) in enumerate(graphs):
-        for g2 in generate_random_subgraphs(r, g, 1000):
-            to_index.append((g2, gidx))
+        for nodeset in generate_random_subgraph_nodesets(r, g, 1000):
+            to_index[gidx][1].add(frozenset(nodeset))
 
     database: MotifFinder[int, int, int, int] = MotifFinder(
-        ((g, s) for g, s in to_index),
-        lambda v: len(v[0]),
+        {
+            source: (graph, frozenset(nodesets))
+            for source, (graph, nodesets) in to_index.items()
+        },
         node_label,
         node_vars,
         label_matches=label_matches,
