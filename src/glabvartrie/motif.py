@@ -625,6 +625,9 @@ class MotifFinder(Generic[N, L, V, I]):
         expanded_motif_class = _MotifClass(
             representative=_OccurrenceRef(source=source, nodeset=expanded_nodeset),
             representative_order=representative_expanded_order,
+            occurrences=[(source, tuple(sorted(expanded_nodeset, key=self._node_order_key)))],
+            occurrence_keys={(source, expanded_nodeset)},
+            occurrence_mappings={(source, expanded_nodeset): representative_expanded_order},
         )
 
         for occurrence_source, occurrence_nodes in motif_class.occurrences:
