@@ -139,15 +139,61 @@ class ExpansionState(Generic[N, L, V, I]):
 
 
 class MotifExpansion(Generic[N, L, V, I]):
-    def __init__(self, finder: MotifFinder[N, L, V, I]) -> None:
-        self._finder = finder
+    def __init__(
+        self,
+        finder_or_parents: MotifFinder[N, L, V, I] | Mapping[I, nx.DiGraph[N]],
+        occurrences: Iterable[tuple[I, Iterable[N]]] | None = None,
+        node_label: Callable[[dict[str, Any]], L] | None = None,
+        node_vars: Callable[[dict[str, Any]], tuple[V, ...]] | None = None,
+        *,
+        node_order_key: Callable[[N], Any] | None = None,
+        label_matches: Callable[[L, L], bool] | None = None,
+        sampled_nodesets: Mapping[I, frozenset[frozenset[N]]] | None = None,
+    ) -> None:
+        provided_occurrence_keys: set[tuple[I, frozenset[N]]] = set()
+        if isinstance(finder_or_parents, MotifFinder):
+            self._finder = finder_or_parents
+        else:
+            if occurrences is None or node_label is None or node_vars is None:
+                raise TypeError(
+                    "standalone MotifExpansion requires occurrences, node_label, and node_vars"
+                )
+
+            grouped_occurrences: defaultdict[I, set[frozenset[N]]] = defaultdict(set)
+            for source, witness_nodes in occurrences:
+                nodeset = frozenset(witness_nodes)
+                grouped_occurrences[source].add(nodeset)
+                provided_occurrence_keys.add((source, nodeset))
+
+            samples: dict[I, tuple[nx.DiGraph[N], frozenset[frozenset[N]]]] = {}
+            for source, graph in finder_or_parents.items():
+                nodesets = set(sampled_nodesets.get(source, frozenset()) if sampled_nodesets is not None else ())
+                nodesets.update(grouped_occurrences.get(source, ()))
+                samples[source] = (graph, frozenset(nodesets))
+
+            self._finder = MotifFinder(
+                samples,
+                node_label,
+                node_vars,
+                node_order_key=node_order_key,
+                label_matches=label_matches,
+            )
+
         self._states_by_motif_class: dict[int, ExpansionState[N, L, V, I]] = {}
         self._occurrence_index: dict[tuple[I, frozenset[N]], ExpansionState[N, L, V, I]] = {}
 
-        for motif_classes in finder._motifs_by_size.values():
+        for motif_classes in self._finder._motifs_by_size.values():
             for motif_class in motif_classes:
                 state = self.state_for_motif_class(motif_class)
                 self._register_known_occurrences(state)
+
+        if not isinstance(finder_or_parents, MotifFinder):
+            matching_state_ids = {
+                id(self.state_for_occurrence(source, nodeset)._motif_class)
+                for source, nodeset in provided_occurrence_keys
+            }
+            if len(matching_state_ids) != 1:
+                raise ValueError("provided occurrences do not form a single repeated motif class")
 
     def state_for_motif_class(
         self,

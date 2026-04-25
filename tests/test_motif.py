@@ -226,6 +226,35 @@ class TestUnits(unittest.TestCase):
         state5 = expansion.validate_expansion(recovered_state4, 0, {0, 1, 2, 3}, {0, 1, 2, 3, 4})
         self.assertIsNotNone(state5)
 
+    def test_standalone_motif_expansion(self):
+        g0 = nx.DiGraph()
+        g0.add_node(0, label=0, vars=())
+        g0.add_node(1, label=1, vars=())
+        g0.add_node(2, label=2, vars=())
+        g0.add_node(3, label=3, vars=())
+        g0.add_edges_from([(0, 1), (1, 2), (1, 3), (2, 3)])
+
+        g1 = nx.DiGraph()
+        g1.add_node(10, label=0, vars=())
+        g1.add_node(11, label=1, vars=())
+        g1.add_node(12, label=2, vars=())
+        g1.add_node(13, label=3, vars=())
+        g1.add_edges_from([(10, 11), (11, 12), (11, 13), (12, 13)])
+
+        expansion: MotifExpansion[int, int, int, int] = MotifExpansion(
+            {0: g0, 1: g1},
+            [(0, {0, 1, 2}), (1, {10, 11, 12})],
+            node_label,
+            node_vars,
+        )
+
+        state3 = expansion.state_for_occurrence(0, {0, 1, 2})
+        state4 = expansion.validate_expansion(state3, 0, {0, 1, 2}, {0, 1, 2, 3})
+        self.assertIsNotNone(state4)
+        assert state4 is not None
+        session4 = expansion.materialize(state4)
+        self.assertEqual(list(session4), [(0, (0, 1, 2, 3)), (1, (10, 11, 12, 13))])
+
     def test_expand_unindexed_motif(self):
         g0 = nx.DiGraph()
         g0.add_node(0, label=0, vars=())
