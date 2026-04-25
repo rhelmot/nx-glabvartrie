@@ -1,4 +1,4 @@
 from .database import Database, QuerySession
-from .motif import ExpansionState, MotifFinder, MotifSession
+from .motif import ExpansionState, MotifExpansion, MotifFinder, MotifSession
 
-__all__ = ["Database", "ExpansionState", "MotifFinder", "MotifSession", "QuerySession"]
+__all__ = ["Database", "ExpansionState", "MotifExpansion", "MotifFinder", "MotifSession", "QuerySession"]

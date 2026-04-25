@@ -99,7 +99,7 @@ class MotifSession(Generic[N, L, V, I]):
         witness_key = (source, witness_nodeset)
         if witness_key not in self._motif_class.occurrence_mappings:
             raise ValueError("witness is not an occurrence of this motif")
-        return self._finder._state_for_motif_class(self._motif_class)
+        return self._finder.expansion().state_for_motif_class(self._motif_class)
 
     def expand_from(
         self,
@@ -107,7 +107,7 @@ class MotifSession(Generic[N, L, V, I]):
         expanded_nodes: Iterable[N],
     ) -> MotifSession[N, L, V, I] | None:
         source, witness_nodes = witness
-        next_state = self._finder.validate_expansion(
+        next_state = self._finder.expansion().validate_expansion(
             self.state_for((source, witness_nodes)),
             source,
             witness_nodes,
@@ -115,7 +115,7 @@ class MotifSession(Generic[N, L, V, I]):
         )
         if next_state is None:
             return None
-        return MotifSession(self._finder, self._finder._materialize_state(next_state))
+        return self._finder.expansion().expand_from(next_state)
 
 
 class ExpansionState(Generic[N, L, V, I]):
@@ -138,6 +138,130 @@ class ExpansionState(Generic[N, L, V, I]):
         self._slot_domain_cache: dict[tuple[I, frozenset[N], Hashable], tuple[N, ...]] = {}
 
 
+class MotifExpansion(Generic[N, L, V, I]):
+    def __init__(self, finder: MotifFinder[N, L, V, I]) -> None:
+        self._finder = finder
+        self._states_by_motif_class: dict[int, ExpansionState[N, L, V, I]] = {}
+        self._occurrence_index: dict[tuple[I, frozenset[N]], ExpansionState[N, L, V, I]] = {}
+
+        for motif_classes in finder._motifs_by_size.values():
+            for motif_class in motif_classes:
+                state = self.state_for_motif_class(motif_class)
+                self._register_known_occurrences(state)
+
+    def state_for_motif_class(
+        self,
+        motif_class: _MotifClass[N, I],
+    ) -> ExpansionState[N, L, V, I]:
+        key = id(motif_class)
+        state = self._states_by_motif_class.get(key)
+        if state is None:
+            state = ExpansionState(self._finder, motif_class)
+            self._states_by_motif_class[key] = state
+        return state
+
+    def state_for_occurrence(
+        self,
+        source: I,
+        witness_nodes: Iterable[N],
+    ) -> ExpansionState[N, L, V, I]:
+        witness_nodeset = frozenset(witness_nodes)
+        occurrence_key = (source, witness_nodeset)
+        state = self._occurrence_index.get(occurrence_key)
+        if state is None:
+            raise ValueError("witness is not a known occurrence")
+        return state
+
+    def _register_known_occurrences(
+        self,
+        state: ExpansionState[N, L, V, I],
+    ) -> None:
+        for occurrence_source, occurrence_nodes in state._motif_class.occurrences:
+            self._occurrence_index.setdefault((occurrence_source, frozenset(occurrence_nodes)), state)
+
+    def _bootstrap_successor_state(
+        self,
+        predecessor_state: ExpansionState[N, L, V, I],
+        source: I,
+        witness_nodeset: frozenset[N],
+        expanded_nodeset: frozenset[N],
+    ) -> ExpansionState[N, L, V, I]:
+        motif_class = predecessor_state._motif_class
+        representative_base_order = motif_class.occurrence_mappings[(source, witness_nodeset)]
+        representative_expanded_order = self._finder._expanded_order(source, representative_base_order, expanded_nodeset)
+        expanded_motif_class = _MotifClass(
+            representative=_OccurrenceRef(source=source, nodeset=expanded_nodeset),
+            representative_order=representative_expanded_order,
+            occurrences=[(source, tuple(sorted(expanded_nodeset, key=self._finder._node_order_key)))],
+            occurrence_keys={(source, expanded_nodeset)},
+            occurrence_mappings={(source, expanded_nodeset): representative_expanded_order},
+        )
+        state = self.state_for_motif_class(expanded_motif_class)
+        state._predecessor_state = predecessor_state
+        state._base_size = len(motif_class.representative_order)
+        state._scan_complete = False
+        self._register_known_occurrences(state)
+        return state
+
+    def validate_expansion(
+        self,
+        predecessor_state: ExpansionState[N, L, V, I],
+        source: I,
+        witness_nodes: Iterable[N],
+        expanded_nodes: Iterable[N],
+    ) -> ExpansionState[N, L, V, I] | None:
+        witness_nodeset = frozenset(witness_nodes)
+        expanded_nodeset = frozenset(expanded_nodes)
+        cache_key = (source, witness_nodeset, expanded_nodeset)
+        if cache_key in predecessor_state._expansion_cache:
+            return predecessor_state._expansion_cache[cache_key]
+
+        motif_class = predecessor_state._motif_class
+        witness_key = (source, witness_nodeset)
+        if witness_key not in motif_class.occurrence_mappings:
+            raise ValueError("witness is not an occurrence of this motif")
+        if not witness_nodeset.issubset(expanded_nodeset):
+            raise ValueError("expanded nodes must be a superset of the witness")
+
+        known_state = self._occurrence_index.get((source, expanded_nodeset))
+        if known_state is not None:
+            predecessor_state._expansion_cache[cache_key] = known_state
+            return known_state
+
+        result = self._bootstrap_successor_state(
+            predecessor_state,
+            source,
+            witness_nodeset,
+            expanded_nodeset,
+        )
+        support = 0
+        for _, _, _ in self._finder._iter_state_occurrences(result, stop_after=2):
+            support += 1
+            if support >= 2:
+                break
+        if support < 2:
+            predecessor_state._expansion_cache[cache_key] = None
+            return None
+
+        self._register_known_occurrences(result)
+        predecessor_state._expansion_cache[cache_key] = result
+        return result
+
+    def materialize(
+        self,
+        state: ExpansionState[N, L, V, I],
+    ) -> MotifSession[N, L, V, I]:
+        motif_class = self._finder._materialize_state(state)
+        self._register_known_occurrences(state)
+        return MotifSession(self._finder, motif_class)
+
+    def expand_from(
+        self,
+        state: ExpansionState[N, L, V, I],
+    ) -> MotifSession[N, L, V, I]:
+        return self.materialize(state)
+
+
 class MotifFinder(Generic[N, L, V, I]):
     def __init__(
         self,
@@ -158,7 +282,7 @@ class MotifFinder(Generic[N, L, V, I]):
         self._root: _MotifTrieNode[N, I] = _MotifTrieNode(depth=0, topology_pattern=None)
         self._motif_classes_by_size: dict[int, list[_MotifClass[N, I]]] = defaultdict(list)
         self._parents: dict[I, _ParentSamples[N]] = {}
-        self._expansion_states: dict[int, ExpansionState[N, L, V, I]] = {}
+        self._expander: MotifExpansion[N, L, V, I] | None = None
 
         ordered_occurrences: list[_OccurrenceRef[N, I]] = []
         for source, (graph, nodesets) in sorted(
@@ -307,16 +431,10 @@ class MotifFinder(Generic[N, L, V, I]):
             if surfaced_motif_classes:
                 self._motifs_by_size[size] = surfaced_motif_classes
 
-    def _state_for_motif_class(
-        self,
-        motif_class: _MotifClass[N, I],
-    ) -> ExpansionState[N, L, V, I]:
-        key = id(motif_class)
-        state = self._expansion_states.get(key)
-        if state is None:
-            state = ExpansionState(self, motif_class)
-            self._expansion_states[key] = state
-        return state
+    def expansion(self) -> MotifExpansion[N, L, V, I]:
+        if self._expander is None:
+            self._expander = MotifExpansion(self)
+        return self._expander
 
     def _ensure_trie(self) -> None:
         if self._trie_built:
@@ -772,7 +890,7 @@ class MotifFinder(Generic[N, L, V, I]):
 
         if len(expanded_motif_class.occurrences) < 2:
             return None
-        return self._state_for_motif_class(expanded_motif_class)
+        return self.expansion().state_for_motif_class(expanded_motif_class)
 
     def _candidate_supersets_for(
         self,
@@ -949,44 +1067,7 @@ class MotifFinder(Generic[N, L, V, I]):
         witness_nodes: Iterable[N],
         expanded_nodes: Iterable[N],
     ) -> ExpansionState[N, L, V, I] | None:
-        witness_nodeset = frozenset(witness_nodes)
-        expanded_nodeset = frozenset(expanded_nodes)
-        cache_key = (source, witness_nodeset, expanded_nodeset)
-        if cache_key in predecessor_state._expansion_cache:
-            return predecessor_state._expansion_cache[cache_key]
-
-        motif_class = predecessor_state._motif_class
-        witness_key = (source, witness_nodeset)
-        if witness_key not in motif_class.occurrence_mappings:
-            raise ValueError("witness is not an occurrence of this motif")
-        if not witness_nodeset.issubset(expanded_nodeset):
-            raise ValueError("expanded nodes must be a superset of the witness")
-
-        representative_base_order = motif_class.occurrence_mappings[witness_key]
-        representative_expanded_order = self._expanded_order(source, representative_base_order, expanded_nodeset)
-        expanded_motif_class = _MotifClass(
-            representative=_OccurrenceRef(source=source, nodeset=expanded_nodeset),
-            representative_order=representative_expanded_order,
-            occurrences=[(source, tuple(sorted(expanded_nodeset, key=self._node_order_key)))],
-            occurrence_keys={(source, expanded_nodeset)},
-            occurrence_mappings={(source, expanded_nodeset): representative_expanded_order},
-        )
-        result = ExpansionState(
-            self,
-            expanded_motif_class,
-            predecessor_state=predecessor_state,
-            base_size=len(motif_class.representative_order),
-            scan_complete=False,
-        )
-        support = 0
-        for _, _, _ in self._iter_state_occurrences(result, stop_after=2):
-            support += 1
-            if support >= 2:
-                break
-        if support < 2:
-            result = None
-        predecessor_state._expansion_cache[cache_key] = result
-        return result
+        return self.expansion().validate_expansion(predecessor_state, source, witness_nodes, expanded_nodes)
 
     def motifs(self, size: int | None = None, *, descending: bool = False) -> Iterator[MotifSession[N, L, V, I]]:
         if size is not None:

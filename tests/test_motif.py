@@ -7,7 +7,7 @@ from random import Random
 
 import networkx as nx
 
-from glabvartrie import MotifFinder
+from glabvartrie import MotifExpansion, MotifFinder
 from common import (
     CantEmbed,
     embed_graph,
@@ -195,6 +195,36 @@ class TestUnits(unittest.TestCase):
         self.assertIsNotNone(state4)
         assert state4 is not None
         self.assertIn((0, frozenset({0, 1, 2, 3})), state4._motif_class.occurrence_mappings)
+
+    def test_motif_expansion_recovers_unindexed_state_by_occurrence(self):
+        g0 = nx.DiGraph()
+        for node, label in enumerate(range(5)):
+            g0.add_node(node, label=label, vars=())
+        g0.add_edges_from([(0, 1), (1, 2), (1, 3), (2, 3), (3, 4)])
+
+        g1 = nx.DiGraph()
+        for node, label in zip((10, 11, 12, 13, 14), range(5)):
+            g1.add_node(node, label=label, vars=())
+        g1.add_edges_from([(10, 11), (11, 12), (11, 13), (12, 13), (13, 14)])
+
+        finder: MotifFinder[int, int, int, int] = MotifFinder(
+            {
+                0: (g0, frozenset({frozenset({0, 1, 2})})),
+                1: (g1, frozenset({frozenset({10, 11, 12})})),
+            },
+            node_label,
+            node_vars,
+        )
+        expansion: MotifExpansion[int, int, int, int] = finder.expansion()
+
+        session3 = next(finder.motifs(3))
+        state3 = session3.state_for((0, {0, 1, 2}))
+        state4 = expansion.validate_expansion(state3, 0, {0, 1, 2}, {0, 1, 2, 3})
+        self.assertIsNotNone(state4)
+        recovered_state4 = expansion.state_for_occurrence(0, {0, 1, 2, 3})
+        self.assertIs(recovered_state4, state4)
+        state5 = expansion.validate_expansion(recovered_state4, 0, {0, 1, 2, 3}, {0, 1, 2, 3, 4})
+        self.assertIsNotNone(state5)
 
     def test_expand_unindexed_motif(self):
         g0 = nx.DiGraph()
