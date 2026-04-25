@@ -73,8 +73,6 @@ class MotifSession(Generic[N, L, V, I]):
         self._finder = finder
         self._motif_class = motif_class
         self._occurrences = tuple(motif_class.occurrences)
-        self._expansion_cache: dict[tuple[I, frozenset[N], frozenset[N]], MotifSession[N, L, V, I] | None] = {}
-        self._valid_expansion_cache: dict[tuple[I, frozenset[N], frozenset[N]], bool] = {}
 
     def __iter__(self) -> Iterator[tuple[I, tuple[N, ...]]]:
         return iter(self._occurrences)
@@ -92,53 +90,44 @@ class MotifSession(Generic[N, L, V, I]):
             return list(self._occurrences) == list(other)
         return NotImplemented  # type: ignore[return-value]
 
+    def state_for(
+        self,
+        witness: tuple[I, Iterable[N]],
+    ) -> ExpansionState[N, L, V, I]:
+        source, witness_nodes = witness
+        witness_nodeset = frozenset(witness_nodes)
+        witness_key = (source, witness_nodeset)
+        if witness_key not in self._motif_class.occurrence_mappings:
+            raise ValueError("witness is not an occurrence of this motif")
+        return self._finder._state_for_motif_class(self._motif_class)
+
     def expand_from(
         self,
         witness: tuple[I, Iterable[N]],
         expanded_nodes: Iterable[N],
     ) -> MotifSession[N, L, V, I] | None:
         source, witness_nodes = witness
-        witness_nodeset = frozenset(witness_nodes)
-        expanded_nodeset = frozenset(expanded_nodes)
-        cache_key = (source, witness_nodeset, expanded_nodeset)
-        if cache_key in self._expansion_cache:
-            return self._expansion_cache[cache_key]
-        cached_valid = self._valid_expansion_cache.get(cache_key)
-        if cached_valid is False:
-            self._expansion_cache[cache_key] = None
-            return None
-
-        result = self._finder._expand_motif_class(self._motif_class, source, witness_nodeset, expanded_nodeset)
-        self._valid_expansion_cache[cache_key] = result is not None
-        self._expansion_cache[cache_key] = result
-        return result
-
-    def is_valid_expansion(
-        self,
-        witness: tuple[I, Iterable[N]],
-        expanded_nodes: Iterable[N],
-    ) -> bool:
-        source, witness_nodes = witness
-        witness_nodeset = frozenset(witness_nodes)
-        expanded_nodeset = frozenset(expanded_nodes)
-        cache_key = (source, witness_nodeset, expanded_nodeset)
-        cached_expansion = self._expansion_cache.get(cache_key)
-        if cached_expansion is not None:
-            return True
-        if cache_key in self._expansion_cache:
-            return False
-        cached_valid = self._valid_expansion_cache.get(cache_key)
-        if cached_valid is not None:
-            return cached_valid
-
-        result = self._finder._is_valid_motif_expansion(
-            self._motif_class,
+        next_state = self._finder.validate_expansion(
+            self.state_for((source, witness_nodes)),
             source,
-            witness_nodeset,
-            expanded_nodeset,
+            witness_nodes,
+            expanded_nodes,
         )
-        self._valid_expansion_cache[cache_key] = result
-        return result
+        if next_state is None:
+            return None
+        return MotifSession(self._finder, next_state._motif_class)
+
+
+class ExpansionState(Generic[N, L, V, I]):
+    def __init__(
+        self,
+        finder: MotifFinder[N, L, V, I],
+        motif_class: _MotifClass[N, I],
+    ) -> None:
+        self._finder = finder
+        self._motif_class = motif_class
+        self._expansion_cache: dict[tuple[I, frozenset[N], frozenset[N]], ExpansionState[N, L, V, I] | None] = {}
+        self._candidate_supersets_cache: dict[tuple[I, frozenset[N], int], tuple[frozenset[N], ...]] = {}
 
 
 class MotifFinder(Generic[N, L, V, I]):
@@ -161,6 +150,7 @@ class MotifFinder(Generic[N, L, V, I]):
         self._root: _MotifTrieNode[N, I] = _MotifTrieNode(depth=0, topology_pattern=None)
         self._motif_classes_by_size: dict[int, list[_MotifClass[N, I]]] = defaultdict(list)
         self._parents: dict[I, _ParentSamples[N]] = {}
+        self._expansion_states: dict[int, ExpansionState[N, L, V, I]] = {}
 
         ordered_occurrences: list[_OccurrenceRef[N, I]] = []
         for source, (graph, nodesets) in sorted(
@@ -308,6 +298,17 @@ class MotifFinder(Generic[N, L, V, I]):
             )
             if surfaced_motif_classes:
                 self._motifs_by_size[size] = surfaced_motif_classes
+
+    def _state_for_motif_class(
+        self,
+        motif_class: _MotifClass[N, I],
+    ) -> ExpansionState[N, L, V, I]:
+        key = id(motif_class)
+        state = self._expansion_states.get(key)
+        if state is None:
+            state = ExpansionState(self, motif_class)
+            self._expansion_states[key] = state
+        return state
 
     def _ensure_trie(self) -> None:
         if self._trie_built:
@@ -603,11 +604,12 @@ class MotifFinder(Generic[N, L, V, I]):
 
     def _expand_motif_class(
         self,
-        motif_class: _MotifClass[N, I],
+        state: ExpansionState[N, L, V, I],
         source: I,
         witness_nodeset: frozenset[N],
         expanded_nodeset: frozenset[N],
-    ) -> MotifSession[N, L, V, I] | None:
+    ) -> ExpansionState[N, L, V, I] | None:
+        motif_class = state._motif_class
         witness_key = (source, witness_nodeset)
         if witness_key not in motif_class.occurrence_mappings:
             raise ValueError("witness is not an occurrence of this motif")
@@ -629,13 +631,15 @@ class MotifFinder(Generic[N, L, V, I]):
             occurrence_nodeset = frozenset(occurrence_nodes)
             occurrence_key = (occurrence_source, occurrence_nodeset)
             base_order = motif_class.occurrence_mappings[occurrence_key]
-            parent = self._parents[occurrence_source]
 
             sampled_match: tuple[N, ...] | None = None
-            for candidate_nodeset in parent.nodesets_by_size.get(len(expanded_nodeset), ()):
-                if not occurrence_nodeset.issubset(candidate_nodeset):
-                    continue
-                candidate_graph = parent.graph.subgraph(candidate_nodeset)
+            for candidate_nodeset in self._candidate_supersets_for(
+                state,
+                occurrence_source,
+                occurrence_nodeset,
+                len(expanded_nodeset),
+            ):
+                candidate_graph = self._parents[occurrence_source].graph.subgraph(candidate_nodeset)
                 assert isinstance(candidate_graph, nx.DiGraph)
                 mapping = self._find_anchored_expansion(
                     representative_graph,
@@ -653,7 +657,7 @@ class MotifFinder(Generic[N, L, V, I]):
                     representative_graph,
                     representative_expanded_order,
                     len(representative_base_order),
-                    parent.graph,
+                    self._parents[occurrence_source].graph,
                     base_order,
                 )
 
@@ -671,67 +675,50 @@ class MotifFinder(Generic[N, L, V, I]):
 
         if len(expanded_motif_class.occurrences) < 2:
             return None
-        return MotifSession(self, expanded_motif_class)
+        return self._state_for_motif_class(expanded_motif_class)
 
-    def _is_valid_motif_expansion(
+    def _candidate_supersets_for(
         self,
-        motif_class: _MotifClass[N, I],
+        state: ExpansionState[N, L, V, I],
         source: I,
         witness_nodeset: frozenset[N],
-        expanded_nodeset: frozenset[N],
-    ) -> bool:
-        witness_key = (source, witness_nodeset)
-        if witness_key not in motif_class.occurrence_mappings:
-            raise ValueError("witness is not an occurrence of this motif")
-        if not witness_nodeset.issubset(expanded_nodeset):
-            raise ValueError("expanded nodes must be a superset of the witness")
+        target_size: int,
+    ) -> tuple[frozenset[N], ...]:
+        cache_key = (source, witness_nodeset, target_size)
+        cached = state._candidate_supersets_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        representative_base_order = motif_class.representative_order
-        origin_base_order = motif_class.occurrence_mappings[witness_key]
-        representative_expanded_order = self._expanded_order(source, origin_base_order, expanded_nodeset)
-        representative_graph = self._parents[source].graph.subgraph(expanded_nodeset)
-        assert isinstance(representative_graph, nx.DiGraph)
+        parent = self._parents[source]
+        candidates = tuple(
+            candidate_nodeset
+            for candidate_nodeset in parent.nodesets_by_size.get(target_size, ())
+            if witness_nodeset.issubset(candidate_nodeset)
+        )
+        state._candidate_supersets_cache[cache_key] = candidates
+        return candidates
 
-        matched_occurrences = 0
-        for occurrence_source, occurrence_nodes in motif_class.occurrences:
-            occurrence_nodeset = frozenset(occurrence_nodes)
-            occurrence_key = (occurrence_source, occurrence_nodeset)
-            base_order = motif_class.occurrence_mappings[occurrence_key]
-            parent = self._parents[occurrence_source]
+    def validate_expansion(
+        self,
+        predecessor_state: ExpansionState[N, L, V, I],
+        source: I,
+        witness_nodes: Iterable[N],
+        expanded_nodes: Iterable[N],
+    ) -> ExpansionState[N, L, V, I] | None:
+        witness_nodeset = frozenset(witness_nodes)
+        expanded_nodeset = frozenset(expanded_nodes)
+        cache_key = (source, witness_nodeset, expanded_nodeset)
+        if cache_key in predecessor_state._expansion_cache:
+            return predecessor_state._expansion_cache[cache_key]
 
-            sampled_match: tuple[N, ...] | None = None
-            for candidate_nodeset in parent.nodesets_by_size.get(len(expanded_nodeset), ()):
-                if not occurrence_nodeset.issubset(candidate_nodeset):
-                    continue
-                candidate_graph = parent.graph.subgraph(candidate_nodeset)
-                assert isinstance(candidate_graph, nx.DiGraph)
-                mapping = self._find_anchored_expansion(
-                    representative_graph,
-                    representative_expanded_order,
-                    len(representative_base_order),
-                    candidate_graph,
-                    base_order,
-                )
-                if mapping is not None:
-                    sampled_match = mapping
-                    break
-
-            if sampled_match is None:
-                sampled_match = self._find_anchored_expansion(
-                    representative_graph,
-                    representative_expanded_order,
-                    len(representative_base_order),
-                    parent.graph,
-                    base_order,
-                )
-
-            if sampled_match is None:
-                continue
-            matched_occurrences += 1
-            if matched_occurrences >= 2:
-                return True
-
-        return False
+        result = self._expand_motif_class(
+            predecessor_state,
+            source,
+            witness_nodeset,
+            expanded_nodeset,
+        )
+        predecessor_state._expansion_cache[cache_key] = result
+        return result
 
     def motifs(self, size: int | None = None, *, descending: bool = False) -> Iterator[MotifSession[N, L, V, I]]:
         if size is not None:

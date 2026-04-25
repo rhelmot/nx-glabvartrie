@@ -131,14 +131,18 @@ class TestUnits(unittest.TestCase):
         )
 
         session3 = next(finder.motifs(3))
-        self.assertTrue(session3.is_valid_expansion((0, {0, 1, 2}), {0, 1, 2, 3}))
+        state3 = session3.state_for((0, {0, 1, 2}))
+        state4 = finder.validate_expansion(state3, 0, {0, 1, 2}, {0, 1, 2, 3})
+        self.assertIsNotNone(state4)
         with self.assertRaises(ValueError):
-            session3.is_valid_expansion((0, {0, 1, 2}), {0, 1})
+            finder.validate_expansion(state3, 0, {0, 1, 2}, {0, 1})
 
         session4 = session3.expand_from((0, {0, 1, 2}), {0, 1, 2, 3})
         self.assertIsNotNone(session4)
         assert session4 is not None
-        self.assertTrue(session4.is_valid_expansion((0, {0, 1, 2, 3}), {0, 1, 2, 3, 4}))
+        assert state4 is not None
+        state5 = finder.validate_expansion(state4, 0, {0, 1, 2, 3}, {0, 1, 2, 3, 4})
+        self.assertIsNotNone(state5)
 
         session5 = session4.expand_from((0, {0, 1, 2, 3}), {0, 1, 2, 3, 4})
         self.assertIsNotNone(session5)
