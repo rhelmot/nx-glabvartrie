@@ -135,6 +135,7 @@ class ExpansionState(Generic[N, L, V, I]):
         self._scan_complete = scan_complete
         self._expansion_cache: dict[tuple[I, frozenset[N], frozenset[N]], ExpansionState[N, L, V, I] | None] = {}
         self._candidate_supersets_cache: dict[tuple[I, frozenset[N], int], tuple[frozenset[N], ...]] = {}
+        self._slot_domain_cache: dict[tuple[I, frozenset[N], Hashable], tuple[N, ...]] = {}
 
 
 class MotifFinder(Generic[N, L, V, I]):
@@ -545,8 +546,46 @@ class MotifFinder(Generic[N, L, V, I]):
                     in_degree,
                     out_degree,
                 )
-            )
+        )
         return tuple(sorted(extra_signatures))
+
+    def _anchored_slot_signature(
+        self,
+        graph: nx.DiGraph[N],
+        base_order: tuple[N, ...],
+        node: N,
+    ) -> tuple[Any, ...]:
+        variables = self._node_vars(graph.nodes[node])
+        return (
+            self._node_label(graph.nodes[node]) if self._default_label_matches else None,
+            len(variables),
+            tuple(int(graph.has_edge(base_node, node)) for base_node in base_order),
+            tuple(int(graph.has_edge(node, base_node)) for base_node in base_order),
+            graph.has_edge(node, node),
+        )
+
+    def _candidate_domain_for_slot(
+        self,
+        state: ExpansionState[N, L, V, I],
+        occurrence_source: I,
+        occurrence_nodeset: frozenset[N],
+        base_order: tuple[N, ...],
+        slot_signature: Hashable,
+    ) -> tuple[N, ...]:
+        cache_key = (occurrence_source, occurrence_nodeset, slot_signature)
+        cached = state._slot_domain_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        graph = self._parents[occurrence_source].graph
+        candidates = tuple(
+            candidate
+            for candidate in graph.nodes
+            if candidate not in occurrence_nodeset
+            and self._anchored_slot_signature(graph, base_order, candidate) == slot_signature
+        )
+        state._slot_domain_cache[cache_key] = candidates
+        return candidates
 
     def _find_anchored_expansion(
         self,
@@ -555,6 +594,7 @@ class MotifFinder(Generic[N, L, V, I]):
         base_size: int,
         target_graph: nx.DiGraph[N],
         target_base_order: tuple[N, ...],
+        candidate_domains: dict[N, tuple[N, ...]] | None = None,
     ) -> tuple[N, ...] | None:
         used_targets = set(target_base_order)
         mapping = {
@@ -589,26 +629,27 @@ class MotifFinder(Generic[N, L, V, I]):
 
         target_nodes = tuple(target_graph.nodes)
         search_positions = list(range(base_size, len(representative_order)))
-        candidate_domains: dict[N, tuple[N, ...]] = {}
-        for position in search_positions:
-            source_node = representative_order[position]
-            source_label = self._node_label(representative_graph.nodes[source_node])
-            source_vars = self._node_vars(representative_graph.nodes[source_node])
-            candidate_domains[source_node] = tuple(
-                candidate
-                for candidate in target_nodes
-                if candidate not in used_targets
-                and self._label_matches(source_label, self._node_label(target_graph.nodes[candidate]))
-                and len(source_vars) == len(self._node_vars(target_graph.nodes[candidate]))
-                and target_graph.has_edge(candidate, candidate) == representative_graph.has_edge(source_node, source_node)
-                and all(
-                    representative_graph.has_edge(representative_order[previous_position], source_node)
-                    == target_graph.has_edge(target_base_order[previous_position], candidate)
-                    and representative_graph.has_edge(source_node, representative_order[previous_position])
-                    == target_graph.has_edge(candidate, target_base_order[previous_position])
-                    for previous_position in range(base_size)
+        if candidate_domains is None:
+            candidate_domains = {}
+            for position in search_positions:
+                source_node = representative_order[position]
+                source_label = self._node_label(representative_graph.nodes[source_node])
+                source_vars = self._node_vars(representative_graph.nodes[source_node])
+                candidate_domains[source_node] = tuple(
+                    candidate
+                    for candidate in target_nodes
+                    if candidate not in used_targets
+                    and self._label_matches(source_label, self._node_label(target_graph.nodes[candidate]))
+                    and len(source_vars) == len(self._node_vars(target_graph.nodes[candidate]))
+                    and target_graph.has_edge(candidate, candidate) == representative_graph.has_edge(source_node, source_node)
+                    and all(
+                        representative_graph.has_edge(representative_order[previous_position], source_node)
+                        == target_graph.has_edge(target_base_order[previous_position], candidate)
+                        and representative_graph.has_edge(source_node, representative_order[previous_position])
+                        == target_graph.has_edge(candidate, target_base_order[previous_position])
+                        for previous_position in range(base_size)
+                    )
                 )
-            )
         search_positions.sort(key=lambda position: len(candidate_domains[representative_order[position]]))
         if search_positions and len(candidate_domains[representative_order[search_positions[0]]]) == 0:
             return None
@@ -769,6 +810,23 @@ class MotifFinder(Generic[N, L, V, I]):
             state._motif_class.representative.nodeset
         )
         assert isinstance(representative_graph, nx.DiGraph)
+        cache_owner = state._predecessor_state if state._predecessor_state is not None else state
+        candidate_domains: dict[N, tuple[N, ...]] = {}
+        for source_node in state._motif_class.representative_order[state._base_size:]:
+            slot_signature = self._anchored_slot_signature(
+                representative_graph,
+                state._motif_class.representative_order[:state._base_size],
+                source_node,
+            )
+            candidate_domains[source_node] = self._candidate_domain_for_slot(
+                cache_owner,
+                occurrence_source,
+                occurrence_nodeset,
+                base_order,
+                slot_signature,
+            )
+            if not candidate_domains[source_node]:
+                return None
 
         sampled_match: tuple[N, ...] | None = None
         for candidate_nodeset in self._candidate_supersets_for(
@@ -794,6 +852,7 @@ class MotifFinder(Generic[N, L, V, I]):
                 state._base_size,
                 candidate_graph,
                 base_order,
+                candidate_domains,
             )
             if mapping is not None:
                 sampled_match = mapping
@@ -806,6 +865,7 @@ class MotifFinder(Generic[N, L, V, I]):
                 state._base_size,
                 self._parents[occurrence_source].graph,
                 base_order,
+                candidate_domains,
             )
 
         return sampled_match
