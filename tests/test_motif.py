@@ -50,6 +50,8 @@ def generate_and_test_corpus(r: Random, graph_generator: Callable[[Random], nx.D
                 found_in.add(graph_idx)
                 motif_embeddings[motif_index].append((graph_idx, tuple(sorted(embedding.values()))))
                 break
+            else:
+                assert False, "Could not embed a graph enough times"
 
     to_index: dict[int, tuple[nx.DiGraph[int], set[frozenset[int]]]] = {
         gidx: (g, set())
@@ -186,17 +188,24 @@ class TestUnits(unittest.TestCase):
         )
 
     def test_motifs_all_sizes_ordering(self):
-        graph = nx.DiGraph()
-        graph.add_node(0, label=0, vars=())
-        graph.add_node(1, label=1, vars=())
-        graph.add_node(2, label=2, vars=())
-        graph.add_edge(0, 1)
-        graph.add_edge(1, 2)
+        graph0 = nx.DiGraph()
+        graph0.add_node(0, label=0, vars=())
+        graph0.add_node(1, label=1, vars=())
+        graph0.add_node(2, label=2, vars=())
+        graph0.add_edge(0, 1)
+        graph0.add_edge(1, 2)
+
+        graph1 = nx.DiGraph()
+        graph1.add_node(10, label=0, vars=())
+        graph1.add_node(11, label=1, vars=())
+        graph1.add_node(12, label=2, vars=())
+        graph1.add_edge(10, 11)
+        graph1.add_edge(11, 12)
 
         finder: MotifFinder[int, int, int, int] = MotifFinder(
             {
                 0: (
-                    graph,
+                    graph0,
                     frozenset(
                         {
                             frozenset({0}),
@@ -204,7 +213,17 @@ class TestUnits(unittest.TestCase):
                             frozenset({0, 1, 2}),
                         }
                     ),
-                )
+                ),
+                1: (
+                    graph1,
+                    frozenset(
+                        {
+                            frozenset({10}),
+                            frozenset({10, 11}),
+                            frozenset({10, 11, 12}),
+                        }
+                    ),
+                ),
             },
             node_label,
             node_vars,
@@ -217,7 +236,26 @@ class TestUnits(unittest.TestCase):
         self.assertEqual([len(motif[0][1]) for motif in ascending], [1, 2, 3])
         self.assertEqual([len(motif[0][1]) for motif in descending], [3, 2, 1])
         self.assertEqual(len(only_size_two), 1)
-        self.assertEqual(only_size_two[0], [(0, (0, 1))])
+        self.assertEqual(only_size_two[0], [(0, (0, 1)), (1, (10, 11))])
+
+    def test_singleton_motifs_are_filtered(self):
+        graph = nx.DiGraph()
+        graph.add_node(0, label=0, vars=())
+        graph.add_node(1, label=1, vars=())
+        graph.add_edge(0, 1)
+
+        finder: MotifFinder[int, int, int, int] = MotifFinder(
+            {
+                0: (
+                    graph,
+                    frozenset({frozenset({0, 1})}),
+                ),
+            },
+            node_label,
+            node_vars,
+        )
+
+        self.assertEqual(list(finder.motifs()), [])
 
 class TestFuzz(unittest.TestCase):
     def test_fuzz_small(self):
@@ -256,7 +294,7 @@ class TestFuzz(unittest.TestCase):
             min_motif_size = 3
             minimum_graph_size = 100
             minimum_available_nodes = num_graphs * minimum_graph_size
-            max_motifs = minimum_available_nodes // max_motif_size
+            max_motifs = minimum_available_nodes // (max_motif_size * max_num_embeddings)
             num_motifs = rr.randrange(1, max_motifs)
 
             generate_and_test_corpus(

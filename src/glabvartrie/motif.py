@@ -17,7 +17,6 @@ from .common import (
     _default_node_order_key,
     _stable_value_key,
     graph_isomorphism_mapping,
-    graphs_are_isomorphic,
     topologies_are_isomorphic,
     topology_patterns_for_order,
 )
@@ -50,6 +49,7 @@ class _MotifTrieNode(Generic[N, I]):
 class _TopologyClass(Generic[N, I]):
     representative: _OccurrenceRef[N, I]
     terminal: _MotifTrieNode[N, I] | None = None
+    occurrences: list[_OccurrenceRef[N, I]] = field(default_factory=list)
     motif_classes: list[_MotifClass[N, I]] = field(default_factory=list)
     motif_classes_by_hash: dict[Hashable, list[_MotifClass[N, I]]] = field(default_factory=lambda: defaultdict(list))
 
@@ -197,13 +197,22 @@ class MotifFinder(Generic[N, L, V, I]):
             )
         )
 
+        topology_hashes: dict[_OccurrenceRef[N, I], Hashable] = {}
+        topology_hash_counts: defaultdict[tuple[int, Hashable], int] = defaultdict(int)
+        for occurrence in ordered_occurrences:
+            topology_hash = self._topology_hash(occurrence)
+            topology_hashes[occurrence] = topology_hash
+            topology_hash_counts[(len(occurrence.nodeset), topology_hash)] += 1
+
         topology_classes_by_size: dict[int, dict[Hashable, list[_TopologyClass[N, I]]]] = defaultdict(lambda: defaultdict(list))
 
         for occurrence in ordered_occurrences:
             sample_size = len(occurrence.nodeset)
-            sample_graph = self._subgraph(occurrence)
+            topology_hash = topology_hashes[occurrence]
+            if topology_hash_counts[(sample_size, topology_hash)] < 2:
+                continue
 
-            topology_hash = self._topology_hash(occurrence)
+            sample_graph = self._subgraph(occurrence)
             topology_classes = topology_classes_by_size[sample_size][topology_hash]
             topology_class: _TopologyClass[N, I] | None = None
             for candidate in topology_classes:
@@ -214,38 +223,76 @@ class MotifFinder(Generic[N, L, V, I]):
             if topology_class is None:
                 topology_class = _TopologyClass(representative=occurrence)
                 topology_classes.append(topology_class)
+            topology_class.occurrences.append(occurrence)
 
-            labeled_hash = self._labeled_hash(occurrence)
-            motif_class_bucket = topology_class.motif_classes_by_hash[labeled_hash]
-            occurrence_nodes = tuple(sorted(occurrence.nodeset, key=self._node_order_key))
-            occurrence_key = (occurrence.source, occurrence.nodeset)
-            for motif_class in motif_class_bucket:
-                mapping = graph_isomorphism_mapping(
-                    self._subgraph(motif_class.representative),
-                    sample_graph,
-                    self._node_label,
-                    self._node_vars,
-                    self._label_matches,
-                )
-                if mapping is not None:
-                    if occurrence_key not in motif_class.occurrence_keys:
-                        motif_class.occurrences.append((occurrence.source, occurrence_nodes))
-                        motif_class.occurrence_keys.add(occurrence_key)
-                        motif_class.occurrence_mappings[occurrence_key] = tuple(
-                            mapping[node] for node in motif_class.representative_order
-                        )
-                    break
-            else:
-                motif_class = _MotifClass(
-                    representative=occurrence,
-                    representative_order=occurrence_nodes,
-                    occurrences=[(occurrence.source, occurrence_nodes)],
-                    occurrence_keys={occurrence_key},
-                    occurrence_mappings={occurrence_key: occurrence_nodes},
-                )
-                motif_class_bucket.append(motif_class)
-                topology_class.motif_classes.append(motif_class)
-                self._motif_classes_by_size[sample_size].append(motif_class)
+        for sample_size, topology_classes_by_hash in topology_classes_by_size.items():
+            for topology_hash, topology_classes in list(topology_classes_by_hash.items()):
+                surviving_topology_classes: list[_TopologyClass[N, I]] = []
+                for topology_class in topology_classes:
+                    if len(topology_class.occurrences) < 2:
+                        continue
+
+                    labeled_hashes: dict[_OccurrenceRef[N, I], Hashable] = {}
+                    labeled_hash_counts: defaultdict[Hashable, int] = defaultdict(int)
+                    for occurrence in topology_class.occurrences:
+                        labeled_hash = self._labeled_hash(occurrence)
+                        labeled_hashes[occurrence] = labeled_hash
+                        labeled_hash_counts[labeled_hash] += 1
+
+                    for occurrence in topology_class.occurrences:
+                        labeled_hash = labeled_hashes[occurrence]
+                        if labeled_hash_counts[labeled_hash] < 2:
+                            continue
+
+                        sample_graph = self._subgraph(occurrence)
+                        motif_class_bucket = topology_class.motif_classes_by_hash[labeled_hash]
+                        occurrence_nodes = tuple(sorted(occurrence.nodeset, key=self._node_order_key))
+                        occurrence_key = (occurrence.source, occurrence.nodeset)
+                        for motif_class in motif_class_bucket:
+                            mapping = graph_isomorphism_mapping(
+                                self._subgraph(motif_class.representative),
+                                sample_graph,
+                                self._node_label,
+                                self._node_vars,
+                                self._label_matches,
+                            )
+                            if mapping is not None:
+                                if occurrence_key not in motif_class.occurrence_keys:
+                                    motif_class.occurrences.append((occurrence.source, occurrence_nodes))
+                                    motif_class.occurrence_keys.add(occurrence_key)
+                                    motif_class.occurrence_mappings[occurrence_key] = tuple(
+                                        mapping[node] for node in motif_class.representative_order
+                                    )
+                                break
+                        else:
+                            motif_class = _MotifClass(
+                                representative=occurrence,
+                                representative_order=occurrence_nodes,
+                                occurrences=[(occurrence.source, occurrence_nodes)],
+                                occurrence_keys={occurrence_key},
+                                occurrence_mappings={occurrence_key: occurrence_nodes},
+                            )
+                            motif_class_bucket.append(motif_class)
+
+                    surfaced_motif_classes = [
+                        motif_class
+                        for motif_classes in topology_class.motif_classes_by_hash.values()
+                        for motif_class in motif_classes
+                        if len(motif_class.occurrences) >= 2
+                    ]
+                    if not surfaced_motif_classes:
+                        topology_class.motif_classes_by_hash.clear()
+                        continue
+
+                    topology_class.motif_classes = surfaced_motif_classes
+                    for motif_class in surfaced_motif_classes:
+                        self._motif_classes_by_size[sample_size].append(motif_class)
+                    surviving_topology_classes.append(topology_class)
+
+                if surviving_topology_classes:
+                    topology_classes_by_hash[topology_hash] = surviving_topology_classes
+                else:
+                    del topology_classes_by_hash[topology_hash]
 
         self._topology_classes_by_size = topology_classes_by_size
         self._trie_built = False
@@ -254,7 +301,13 @@ class MotifFinder(Generic[N, L, V, I]):
         for size, motif_classes in self._motif_classes_by_size.items():
             for motif_class in motif_classes:
                 motif_class.occurrences.sort(key=lambda occurrence: (_stable_value_key(occurrence[0]), occurrence[1]))
-            self._motifs_by_size[size] = tuple(motif_classes)
+            surfaced_motif_classes = tuple(
+                motif_class
+                for motif_class in motif_classes
+                if len(motif_class.occurrences) >= 2
+            )
+            if surfaced_motif_classes:
+                self._motifs_by_size[size] = surfaced_motif_classes
 
     def _ensure_trie(self) -> None:
         if self._trie_built:
@@ -616,7 +669,7 @@ class MotifFinder(Generic[N, L, V, I]):
             expanded_motif_class.occurrence_keys.add(occurrence_cache_key)
             expanded_motif_class.occurrence_mappings[occurrence_cache_key] = sampled_match
 
-        if not expanded_motif_class.occurrences:
+        if len(expanded_motif_class.occurrences) < 2:
             return None
         return MotifSession(self, expanded_motif_class)
 
@@ -639,14 +692,46 @@ class MotifFinder(Generic[N, L, V, I]):
         representative_graph = self._parents[source].graph.subgraph(expanded_nodeset)
         assert isinstance(representative_graph, nx.DiGraph)
 
-        mapping = self._find_anchored_expansion(
-            representative_graph,
-            representative_expanded_order,
-            len(representative_base_order),
-            self._parents[source].graph,
-            origin_base_order,
-        )
-        return mapping is not None
+        matched_occurrences = 0
+        for occurrence_source, occurrence_nodes in motif_class.occurrences:
+            occurrence_nodeset = frozenset(occurrence_nodes)
+            occurrence_key = (occurrence_source, occurrence_nodeset)
+            base_order = motif_class.occurrence_mappings[occurrence_key]
+            parent = self._parents[occurrence_source]
+
+            sampled_match: tuple[N, ...] | None = None
+            for candidate_nodeset in parent.nodesets_by_size.get(len(expanded_nodeset), ()):
+                if not occurrence_nodeset.issubset(candidate_nodeset):
+                    continue
+                candidate_graph = parent.graph.subgraph(candidate_nodeset)
+                assert isinstance(candidate_graph, nx.DiGraph)
+                mapping = self._find_anchored_expansion(
+                    representative_graph,
+                    representative_expanded_order,
+                    len(representative_base_order),
+                    candidate_graph,
+                    base_order,
+                )
+                if mapping is not None:
+                    sampled_match = mapping
+                    break
+
+            if sampled_match is None:
+                sampled_match = self._find_anchored_expansion(
+                    representative_graph,
+                    representative_expanded_order,
+                    len(representative_base_order),
+                    parent.graph,
+                    base_order,
+                )
+
+            if sampled_match is None:
+                continue
+            matched_occurrences += 1
+            if matched_occurrences >= 2:
+                return True
+
+        return False
 
     def motifs(self, size: int | None = None, *, descending: bool = False) -> Iterator[MotifSession[N, L, V, I]]:
         if size is not None:
