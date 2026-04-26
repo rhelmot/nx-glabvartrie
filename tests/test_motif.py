@@ -7,7 +7,7 @@ from random import Random
 
 import networkx as nx
 
-from glabvartrie import MotifExpansion, MotifFinder
+from glabvartrie import MotifExpansion, MotifFinder, graph_isomorphism_mapping, graphs_are_isomorphic
 from common import (
     CantEmbed,
     embed_graph,
@@ -110,6 +110,31 @@ def generate_and_test_corpus(r: Random, graph_generator: Callable[[Random], nx.D
         assert not wanted_motifs, f"We missed {len(wanted_motifs)} embedded motif(s) of size {motif_size}"
 
 class TestUnits(unittest.TestCase):
+    def test_public_graph_isomorphism_helpers(self):
+        g0 = nx.DiGraph()
+        g0.add_node(0, label=0, vars=(100,))
+        g0.add_node(1, label=1, vars=(200,))
+        g0.add_edge(0, 1)
+
+        g1 = nx.DiGraph()
+        g1.add_node(10, label=0, vars=(300,))
+        g1.add_node(11, label=1, vars=(400,))
+        g1.add_edge(10, 11)
+
+        g2 = nx.DiGraph()
+        g2.add_node(20, label=0, vars=(300,))
+        g2.add_node(21, label=2, vars=(400,))
+        g2.add_edge(20, 21)
+
+        self.assertTrue(graphs_are_isomorphic(g0, g1, node_label, node_vars))
+        mapping = graph_isomorphism_mapping(g0, g1, node_label, node_vars)
+        self.assertIsNotNone(mapping)
+        assert mapping is not None
+        self.assertEqual(set(mapping), {0, 1})
+        self.assertEqual(set(mapping.values()), {10, 11})
+        self.assertFalse(graphs_are_isomorphic(g0, g2, node_label, node_vars))
+        self.assertIsNone(graph_isomorphism_mapping(g0, g2, node_label, node_vars))
+
     def test_is_valid_expansion_supports_chaining(self):
         g0 = nx.DiGraph()
         for node, label in enumerate(range(5)):
