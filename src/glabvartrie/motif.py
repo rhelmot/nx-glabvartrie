@@ -64,13 +64,24 @@ class _ParentSamples(Generic[N]):
     subgraph_cache: dict[frozenset[N], nx.DiGraph[N]] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class _ExpansionParent(Generic[N]):
+    graph: nx.DiGraph[N]
+    nodes: tuple[N, ...]
+    labels: dict[N, Any]
+    variables: dict[N, tuple[Any, ...]]
+    subgraph_cache: dict[frozenset[N], nx.DiGraph[N]] = field(default_factory=dict)
+
+
 class MotifSession(Generic[N, L, V, I]):
     def __init__(
         self,
-        finder: MotifFinder[N, L, V, I],
+        finder: MotifFinder[N, L, V, I] | None,
         motif_class: _MotifClass[N, I],
+        expansion: MotifExpansion[N, L, V, I] | None = None,
     ) -> None:
         self._finder = finder
+        self._expansion = expansion
         self._motif_class = motif_class
         self._occurrences = tuple(motif_class.occurrences)
 
@@ -99,7 +110,7 @@ class MotifSession(Generic[N, L, V, I]):
         witness_key = (source, witness_nodeset)
         if witness_key not in self._motif_class.occurrence_mappings:
             raise ValueError("witness is not an occurrence of this motif")
-        return self._finder.expansion().state_for_motif_class(self._motif_class)
+        return self._expansion_engine().state_for_motif_class(self._motif_class)
 
     def expand_from(
         self,
@@ -107,7 +118,8 @@ class MotifSession(Generic[N, L, V, I]):
         expanded_nodes: Iterable[N],
     ) -> MotifSession[N, L, V, I] | None:
         source, witness_nodes = witness
-        next_state = self._finder.expansion().validate_expansion(
+        expansion = self._expansion_engine()
+        next_state = expansion.validate_expansion(
             self.state_for((source, witness_nodes)),
             source,
             witness_nodes,
@@ -115,27 +127,36 @@ class MotifSession(Generic[N, L, V, I]):
         )
         if next_state is None:
             return None
-        return self._finder.expansion().expand_from(next_state)
+        return expansion.expand_from(next_state)
+
+    def _expansion_engine(self) -> MotifExpansion[N, L, V, I]:
+        if self._expansion is not None:
+            return self._expansion
+        if self._finder is None:
+            raise RuntimeError("This motif session is not attached to an expansion engine")
+        return self._finder.expansion()
 
 
 class ExpansionState(Generic[N, L, V, I]):
     def __init__(
         self,
-        finder: MotifFinder[N, L, V, I],
+        finder: MotifFinder[N, L, V, I] | None,
         motif_class: _MotifClass[N, I],
         *,
+        expansion: MotifExpansion[N, L, V, I] | None = None,
         predecessor_state: ExpansionState[N, L, V, I] | None = None,
         base_size: int | None = None,
         scan_complete: bool = True,
     ) -> None:
         self._finder = finder
+        self._expansion = expansion
         self._motif_class = motif_class
         self._predecessor_state = predecessor_state
         self._base_size = base_size
         self._scan_complete = scan_complete
         self._expansion_cache: dict[tuple[I, frozenset[N], frozenset[N]], ExpansionState[N, L, V, I] | None] = {}
-        self._candidate_supersets_cache: dict[tuple[I, frozenset[N], int], tuple[frozenset[N], ...]] = {}
-        self._slot_domain_cache: dict[tuple[I, frozenset[N], Hashable], tuple[N, ...]] = {}
+        self._slot_domain_cache: dict[tuple[I, frozenset[N], tuple[N, ...], Hashable], tuple[N, ...]] = {}
+        self._match_cache: dict[tuple[I, frozenset[N]], tuple[N, ...] | None] = {}
 
 
 class MotifExpansion(Generic[N, L, V, I]):
@@ -153,11 +174,26 @@ class MotifExpansion(Generic[N, L, V, I]):
         provided_occurrence_keys: set[tuple[I, frozenset[N]]] = set()
         if isinstance(finder_or_parents, MotifFinder):
             self._finder = finder_or_parents
+            self._node_label = finder_or_parents._node_label
+            self._node_vars = finder_or_parents._node_vars
+            self._node_order_key = finder_or_parents._node_order_key
+            self._label_matches = finder_or_parents._label_matches
+            self._default_label_matches = finder_or_parents._default_label_matches
+            self._parents = {
+                source: self._build_parent(parent.graph, parent.nodesets)
+                for source, parent in finder_or_parents._parents.items()
+            }
         else:
             if occurrences is None or node_label is None or node_vars is None:
                 raise TypeError(
                     "standalone MotifExpansion requires occurrences, node_label, and node_vars"
                 )
+            self._finder = None
+            self._node_label = node_label
+            self._node_vars = node_vars
+            self._node_order_key = node_order_key or _default_node_order_key  # type: ignore[assignment]
+            self._label_matches = label_matches or _default_label_matches
+            self._default_label_matches = label_matches is None or label_matches is _default_label_matches
 
             grouped_occurrences: defaultdict[I, set[frozenset[N]]] = defaultdict(set)
             for source, witness_nodes in occurrences:
@@ -165,35 +201,87 @@ class MotifExpansion(Generic[N, L, V, I]):
                 grouped_occurrences[source].add(nodeset)
                 provided_occurrence_keys.add((source, nodeset))
 
-            samples: dict[I, tuple[nx.DiGraph[N], frozenset[frozenset[N]]]] = {}
+            self._parents = {}
             for source, graph in finder_or_parents.items():
                 nodesets = set(sampled_nodesets.get(source, frozenset()) if sampled_nodesets is not None else ())
                 nodesets.update(grouped_occurrences.get(source, ()))
-                samples[source] = (graph, frozenset(nodesets))
+                self._parents[source] = self._build_parent(graph, frozenset(nodesets))
 
-            self._finder = MotifFinder(
-                samples,
-                node_label,
-                node_vars,
-                node_order_key=node_order_key,
-                label_matches=label_matches,
-            )
+            missing_sources = set(grouped_occurrences) - set(self._parents)
+            if missing_sources:
+                missing = ", ".join(repr(source) for source in sorted(missing_sources, key=_stable_value_key))
+                raise ValueError(f"occurrences reference unknown parent graph(s): {missing}")
+            if len(provided_occurrence_keys) < 2:
+                raise ValueError("provided occurrences do not form a repeated motif class")
 
         self._states_by_motif_class: dict[int, ExpansionState[N, L, V, I]] = {}
         self._occurrence_index: dict[tuple[I, frozenset[N]], ExpansionState[N, L, V, I]] = {}
 
-        for motif_classes in self._finder._motifs_by_size.values():
-            for motif_class in motif_classes:
-                state = self.state_for_motif_class(motif_class)
-                self._register_known_occurrences(state)
+        if isinstance(finder_or_parents, MotifFinder):
+            for motif_classes in finder_or_parents._motifs_by_size.values():
+                for motif_class in motif_classes:
+                    state = self.state_for_motif_class(motif_class)
+                    self._register_known_occurrences(state)
+        else:
+            state = self._initial_state_for_occurrences(provided_occurrence_keys)
+            self._register_known_occurrences(state)
 
-        if not isinstance(finder_or_parents, MotifFinder):
-            matching_state_ids = {
-                id(self.state_for_occurrence(source, nodeset)._motif_class)
-                for source, nodeset in provided_occurrence_keys
-            }
-            if len(matching_state_ids) != 1:
-                raise ValueError("provided occurrences do not form a single repeated motif class")
+    def _build_parent(
+        self,
+        graph: nx.DiGraph[N],
+        sampled_nodesets: frozenset[frozenset[N]],
+    ) -> _ExpansionParent[N]:
+        return _ExpansionParent(
+            graph=graph,
+            nodes=tuple(sorted(graph.nodes, key=self._node_order_key)),
+            labels={node: self._node_label(graph.nodes[node]) for node in graph.nodes},
+            variables={node: self._node_vars(graph.nodes[node]) for node in graph.nodes},
+        )
+
+    def _initial_state_for_occurrences(
+        self,
+        occurrence_keys: set[tuple[I, frozenset[N]]],
+    ) -> ExpansionState[N, L, V, I]:
+        ordered_keys = tuple(
+            sorted(
+                occurrence_keys,
+                key=lambda key: (
+                    _stable_value_key(key[0]),
+                    len(key[1]),
+                    tuple(self._node_order_key(node) for node in sorted(key[1], key=self._node_order_key)),
+                ),
+            )
+        )
+        representative_source, representative_nodeset = ordered_keys[0]
+        representative_order = tuple(sorted(representative_nodeset, key=self._node_order_key))
+        representative_graph = self._subgraph(representative_source, representative_nodeset)
+
+        motif_class = _MotifClass(
+            representative=_OccurrenceRef(source=representative_source, nodeset=representative_nodeset),
+            representative_order=representative_order,
+        )
+        for source, nodeset in ordered_keys:
+            occurrence_graph = self._subgraph(source, nodeset)
+            occurrence_key = (source, nodeset)
+            occurrence_nodes = tuple(sorted(nodeset, key=self._node_order_key))
+            if occurrence_key == (representative_source, representative_nodeset):
+                mapped_order = representative_order
+            else:
+                mapping = graph_isomorphism_mapping(
+                    representative_graph,
+                    occurrence_graph,
+                    self._node_label,
+                    self._node_vars,
+                    self._label_matches,
+                )
+                if mapping is None:
+                    raise ValueError("provided occurrences do not form a single repeated motif class")
+                mapped_order = tuple(mapping[node] for node in representative_order)
+            motif_class.occurrences.append((source, occurrence_nodes))
+            motif_class.occurrence_keys.add(occurrence_key)
+            motif_class.occurrence_mappings[occurrence_key] = mapped_order
+
+        return self.state_for_motif_class(motif_class)
 
     def state_for_motif_class(
         self,
@@ -202,7 +290,7 @@ class MotifExpansion(Generic[N, L, V, I]):
         key = id(motif_class)
         state = self._states_by_motif_class.get(key)
         if state is None:
-            state = ExpansionState(self._finder, motif_class)
+            state = ExpansionState(self._finder, motif_class, expansion=self)
             self._states_by_motif_class[key] = state
         return state
 
@@ -225,6 +313,20 @@ class MotifExpansion(Generic[N, L, V, I]):
         for occurrence_source, occurrence_nodes in state._motif_class.occurrences:
             self._occurrence_index.setdefault((occurrence_source, frozenset(occurrence_nodes)), state)
 
+    def _subgraph(
+        self,
+        source: I,
+        nodeset: frozenset[N],
+    ) -> nx.DiGraph[N]:
+        parent = self._parents[source]
+        cached = parent.subgraph_cache.get(nodeset)
+        if cached is not None:
+            return cached
+        subgraph = parent.graph.subgraph(nodeset)
+        assert isinstance(subgraph, nx.DiGraph)
+        parent.subgraph_cache[nodeset] = subgraph
+        return subgraph
+
     def _bootstrap_successor_state(
         self,
         predecessor_state: ExpansionState[N, L, V, I],
@@ -234,11 +336,11 @@ class MotifExpansion(Generic[N, L, V, I]):
     ) -> ExpansionState[N, L, V, I]:
         motif_class = predecessor_state._motif_class
         representative_base_order = motif_class.occurrence_mappings[(source, witness_nodeset)]
-        representative_expanded_order = self._finder._expanded_order(source, representative_base_order, expanded_nodeset)
+        representative_expanded_order = self._expanded_order(source, representative_base_order, expanded_nodeset)
         expanded_motif_class = _MotifClass(
             representative=_OccurrenceRef(source=source, nodeset=expanded_nodeset),
             representative_order=representative_expanded_order,
-            occurrences=[(source, tuple(sorted(expanded_nodeset, key=self._finder._node_order_key)))],
+            occurrences=[(source, tuple(sorted(expanded_nodeset, key=self._node_order_key)))],
             occurrence_keys={(source, expanded_nodeset)},
             occurrence_mappings={(source, expanded_nodeset): representative_expanded_order},
         )
@@ -246,7 +348,6 @@ class MotifExpansion(Generic[N, L, V, I]):
         state._predecessor_state = predecessor_state
         state._base_size = len(motif_class.representative_order)
         state._scan_complete = False
-        self._register_known_occurrences(state)
         return state
 
     def validate_expansion(
@@ -281,7 +382,7 @@ class MotifExpansion(Generic[N, L, V, I]):
             expanded_nodeset,
         )
         support = 0
-        for _, _, _ in self._finder._iter_state_occurrences(result, stop_after=2):
+        for _, _, _ in self._iter_state_occurrences(result, stop_after=2):
             support += 1
             if support >= 2:
                 break
@@ -297,15 +398,435 @@ class MotifExpansion(Generic[N, L, V, I]):
         self,
         state: ExpansionState[N, L, V, I],
     ) -> MotifSession[N, L, V, I]:
-        motif_class = self._finder._materialize_state(state)
+        motif_class = self._materialize_state(state)
         self._register_known_occurrences(state)
-        return MotifSession(self._finder, motif_class)
+        return MotifSession(self._finder, motif_class, self)
 
     def expand_from(
         self,
         state: ExpansionState[N, L, V, I],
     ) -> MotifSession[N, L, V, I]:
         return self.materialize(state)
+
+    def _expanded_order(
+        self,
+        source: I,
+        base_order: tuple[N, ...],
+        expanded_nodeset: frozenset[N],
+    ) -> tuple[N, ...]:
+        parent = self._parents[source]
+        graph = parent.graph
+        base_nodes = frozenset(base_order)
+        extra_nodes = expanded_nodeset - base_nodes
+        extra_signatures: list[tuple[tuple[Any, ...], N]] = []
+        for node in extra_nodes:
+            variables = parent.variables[node]
+            local_variable_pattern: dict[Any, int] = {}
+            label_key = (
+                _stable_value_key(parent.labels[node])
+                if self._default_label_matches
+                else None
+            )
+            extra_signatures.append(
+                (
+                    (
+                        label_key,
+                        tuple(local_variable_pattern.setdefault(identifier, len(local_variable_pattern)) for identifier in variables),
+                        len(variables),
+                        tuple(int(graph.has_edge(base_node, node)) for base_node in base_order),
+                        tuple(int(graph.has_edge(node, base_node)) for base_node in base_order),
+                        graph.has_edge(node, node),
+                        sum(1 for predecessor in graph.pred[node] if predecessor in expanded_nodeset),
+                        sum(1 for successor in graph.succ[node] if successor in expanded_nodeset),
+                    ),
+                    node,
+                )
+            )
+        ordered_extra = tuple(
+            node
+            for _, node in sorted(
+                extra_signatures,
+                key=lambda item: (item[0], self._node_order_key(item[1])),
+            )
+        )
+        return base_order + ordered_extra
+
+    def _slot_key(
+        self,
+        source: I,
+        base_order: tuple[N, ...],
+        node: N,
+    ) -> Hashable:
+        parent = self._parents[source]
+        graph = parent.graph
+        variables = parent.variables[node]
+        repeated_from_base: list[int | None] = []
+        for variable_class, identifier in enumerate(variables):
+            repeated_from: int | None = None
+            for position, base_node in enumerate(base_order):
+                base_variables = parent.variables[base_node]
+                if (
+                    variable_class < len(base_variables)
+                    and base_variables[variable_class] == identifier
+                ):
+                    repeated_from = position
+                    break
+            repeated_from_base.append(repeated_from)
+
+        return (
+            parent.labels[node],
+            len(variables),
+            tuple(repeated_from_base),
+            tuple(int(graph.has_edge(base_node, node)) for base_node in base_order),
+            tuple(int(graph.has_edge(node, base_node)) for base_node in base_order),
+            graph.has_edge(node, node),
+        )
+
+    def _can_bind_variables(
+        self,
+        source_vars: tuple[Any, ...],
+        target_vars: tuple[Any, ...],
+        source_to_target: defaultdict[int, dict[Any, Any]],
+        target_to_source: defaultdict[int, dict[Any, Any]],
+    ) -> bool:
+        if len(source_vars) != len(target_vars):
+            return False
+        for variable_class, source_identifier in enumerate(source_vars):
+            target_identifier = target_vars[variable_class]
+            existing_target = source_to_target[variable_class].get(source_identifier)
+            existing_source = target_to_source[variable_class].get(target_identifier)
+            if existing_target is not None and existing_target != target_identifier:
+                return False
+            if existing_source is not None and existing_source != source_identifier:
+                return False
+        return True
+
+    def _bind_variables(
+        self,
+        source_vars: tuple[Any, ...],
+        target_vars: tuple[Any, ...],
+        source_to_target: defaultdict[int, dict[Any, Any]],
+        target_to_source: defaultdict[int, dict[Any, Any]],
+    ) -> bool:
+        if not self._can_bind_variables(source_vars, target_vars, source_to_target, target_to_source):
+            return False
+        for variable_class, source_identifier in enumerate(source_vars):
+            target_identifier = target_vars[variable_class]
+            source_to_target[variable_class][source_identifier] = target_identifier
+            target_to_source[variable_class][target_identifier] = source_identifier
+        return True
+
+    def _initial_variable_state(
+        self,
+        representative_parent: _ExpansionParent[N],
+        representative_order: tuple[N, ...],
+        target_parent: _ExpansionParent[N],
+        target_order: tuple[N, ...],
+        size: int,
+    ) -> tuple[defaultdict[int, dict[Any, Any]], defaultdict[int, dict[Any, Any]]] | None:
+        source_to_target: defaultdict[int, dict[Any, Any]] = defaultdict(dict)
+        target_to_source: defaultdict[int, dict[Any, Any]] = defaultdict(dict)
+        for position in range(size):
+            if not self._bind_variables(
+                representative_parent.variables[representative_order[position]],
+                target_parent.variables[target_order[position]],
+                source_to_target,
+                target_to_source,
+            ):
+                return None
+        return source_to_target, target_to_source
+
+    def _candidate_domain_for_slot(
+        self,
+        cache_owner: ExpansionState[N, L, V, I],
+        representative_source: I,
+        representative_base_order: tuple[N, ...],
+        representative_node: N,
+        target_source: I,
+        target_nodeset: frozenset[N],
+        target_base_order: tuple[N, ...],
+    ) -> tuple[N, ...]:
+        slot_key = self._slot_key(representative_source, representative_base_order, representative_node)
+        cache_key = (target_source, target_nodeset, target_base_order, slot_key)
+        cached = cache_owner._slot_domain_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        representative_parent = self._parents[representative_source]
+        target_parent = self._parents[target_source]
+        representative_graph = representative_parent.graph
+        target_graph = target_parent.graph
+        variable_state = self._initial_variable_state(
+            representative_parent,
+            representative_base_order,
+            target_parent,
+            target_base_order,
+            len(representative_base_order),
+        )
+        if variable_state is None:
+            cache_owner._slot_domain_cache[cache_key] = ()
+            return ()
+        source_to_target, target_to_source = variable_state
+
+        source_label = representative_parent.labels[representative_node]
+        source_vars = representative_parent.variables[representative_node]
+        source_self_loop = representative_graph.has_edge(representative_node, representative_node)
+        source_prev_to_new = tuple(
+            representative_graph.has_edge(base_node, representative_node)
+            for base_node in representative_base_order
+        )
+        source_new_to_prev = tuple(
+            representative_graph.has_edge(representative_node, base_node)
+            for base_node in representative_base_order
+        )
+
+        candidates: list[N] = []
+        for candidate in target_parent.nodes:
+            if candidate in target_nodeset:
+                continue
+            if not self._label_matches(source_label, target_parent.labels[candidate]):
+                continue
+            target_vars = target_parent.variables[candidate]
+            if len(source_vars) != len(target_vars):
+                continue
+            if source_self_loop != target_graph.has_edge(candidate, candidate):
+                continue
+            if source_prev_to_new != tuple(
+                target_graph.has_edge(base_node, candidate)
+                for base_node in target_base_order
+            ):
+                continue
+            if source_new_to_prev != tuple(
+                target_graph.has_edge(candidate, base_node)
+                for base_node in target_base_order
+            ):
+                continue
+            if not self._can_bind_variables(
+                source_vars,
+                target_vars,
+                source_to_target,
+                target_to_source,
+            ):
+                continue
+            candidates.append(candidate)
+
+        cached_candidates = tuple(candidates)
+        cache_owner._slot_domain_cache[cache_key] = cached_candidates
+        return cached_candidates
+
+    def _restore_variable_state(
+        self,
+        source_to_target: defaultdict[int, dict[Any, Any]],
+        target_to_source: defaultdict[int, dict[Any, Any]],
+        source_snapshot: dict[int, dict[Any, Any]],
+        target_snapshot: dict[int, dict[Any, Any]],
+    ) -> None:
+        source_to_target.clear()
+        target_to_source.clear()
+        source_to_target.update({variable_class: dict(value) for variable_class, value in source_snapshot.items()})
+        target_to_source.update({variable_class: dict(value) for variable_class, value in target_snapshot.items()})
+
+    def _find_anchored_expansion(
+        self,
+        representative_source: I,
+        representative_order: tuple[N, ...],
+        base_size: int,
+        target_source: I,
+        target_base_order: tuple[N, ...],
+        candidate_domains: dict[N, tuple[N, ...]],
+    ) -> tuple[N, ...] | None:
+        representative_parent = self._parents[representative_source]
+        target_parent = self._parents[target_source]
+        representative_graph = representative_parent.graph
+        target_graph = target_parent.graph
+        variable_state = self._initial_variable_state(
+            representative_parent,
+            representative_order,
+            target_parent,
+            target_base_order,
+            base_size,
+        )
+        if variable_state is None:
+            return None
+        source_to_target, target_to_source = variable_state
+
+        used_targets = set(target_base_order)
+        mapping = {
+            representative_order[position]: target_base_order[position]
+            for position in range(base_size)
+        }
+        remaining = set(representative_order[base_size:])
+
+        def candidate_fits_edges(source_node: N, candidate: N) -> bool:
+            for previous_source, previous_target in mapping.items():
+                if representative_graph.has_edge(previous_source, source_node) != target_graph.has_edge(previous_target, candidate):
+                    return False
+                if representative_graph.has_edge(source_node, previous_source) != target_graph.has_edge(candidate, previous_target):
+                    return False
+            return True
+
+        def search() -> bool:
+            if not remaining:
+                return True
+
+            source_node = min(
+                remaining,
+                key=lambda node: (
+                    sum(1 for candidate in candidate_domains[node] if candidate not in used_targets),
+                    -sum(1 for mapped_node in mapping if representative_graph.has_edge(mapped_node, node) or representative_graph.has_edge(node, mapped_node)),
+                    self._node_order_key(node),
+                ),
+            )
+            viable_candidates = candidate_domains[source_node]
+            if not any(candidate not in used_targets for candidate in viable_candidates):
+                return False
+
+            source_vars = representative_parent.variables[source_node]
+            remaining.remove(source_node)
+            for candidate in viable_candidates:
+                if candidate in used_targets:
+                    continue
+                if not candidate_fits_edges(source_node, candidate):
+                    continue
+                target_vars = target_parent.variables[candidate]
+                source_snapshot = {variable_class: dict(value) for variable_class, value in source_to_target.items()}
+                target_snapshot = {variable_class: dict(value) for variable_class, value in target_to_source.items()}
+                if not self._bind_variables(source_vars, target_vars, source_to_target, target_to_source):
+                    self._restore_variable_state(source_to_target, target_to_source, source_snapshot, target_snapshot)
+                    continue
+                mapping[source_node] = candidate
+                used_targets.add(candidate)
+                if search():
+                    return True
+                used_targets.remove(candidate)
+                del mapping[source_node]
+                self._restore_variable_state(source_to_target, target_to_source, source_snapshot, target_snapshot)
+            remaining.add(source_node)
+            return False
+
+        if not search():
+            return None
+        return tuple(mapping[node] for node in representative_order)
+
+    def _match_occurrence_expansion(
+        self,
+        state: ExpansionState[N, L, V, I],
+        occurrence_source: I,
+        occurrence_nodeset: frozenset[N],
+        base_order: tuple[N, ...],
+    ) -> tuple[N, ...] | None:
+        cache_key = (occurrence_source, occurrence_nodeset)
+        if cache_key in state._match_cache:
+            return state._match_cache[cache_key]
+        if state._base_size is None:
+            raise ValueError("expansion state missing base size")
+
+        representative_source = state._motif_class.representative.source
+        representative_order = state._motif_class.representative_order
+        representative_base_order = representative_order[:state._base_size]
+        extra_order = representative_order[state._base_size:]
+        if not extra_order:
+            result: tuple[N, ...] | None = base_order
+            state._match_cache[cache_key] = result
+            return result
+
+        cache_owner = state._predecessor_state if state._predecessor_state is not None else state
+        candidate_domains: dict[N, tuple[N, ...]] = {}
+        for representative_node in extra_order:
+            domain = self._candidate_domain_for_slot(
+                cache_owner,
+                representative_source,
+                representative_base_order,
+                representative_node,
+                occurrence_source,
+                occurrence_nodeset,
+                base_order,
+            )
+            if not domain:
+                state._match_cache[cache_key] = None
+                return None
+            candidate_domains[representative_node] = domain
+
+        if len(extra_order) == 1:
+            result = base_order + (candidate_domains[extra_order[0]][0],)
+        else:
+            result = self._find_anchored_expansion(
+                representative_source,
+                representative_order,
+                state._base_size,
+                occurrence_source,
+                base_order,
+                candidate_domains,
+            )
+        state._match_cache[cache_key] = result
+        return result
+
+    def _iter_state_occurrences(
+        self,
+        state: ExpansionState[N, L, V, I],
+        *,
+        stop_after: int | None = None,
+    ) -> Iterator[tuple[I, frozenset[N], tuple[N, ...]]]:
+        yielded: set[tuple[I, frozenset[N]]] = set()
+        for occurrence_source, occurrence_nodes in state._motif_class.occurrences:
+            occurrence_nodeset = frozenset(occurrence_nodes)
+            occurrence_key = (occurrence_source, occurrence_nodeset)
+            yielded.add(occurrence_key)
+            yield (
+                occurrence_source,
+                occurrence_nodeset,
+                state._motif_class.occurrence_mappings[occurrence_key],
+            )
+            if stop_after is not None and len(yielded) >= stop_after:
+                return
+
+        if state._scan_complete:
+            return
+        if state._predecessor_state is None or state._base_size is None:
+            state._scan_complete = True
+            return
+
+        representative_base_key = (
+            state._motif_class.representative.source,
+            frozenset(state._motif_class.representative_order[:state._base_size]),
+        )
+        for occurrence_source, occurrence_nodeset, base_order in self._iter_state_occurrences(state._predecessor_state):
+            if (occurrence_source, occurrence_nodeset) == representative_base_key:
+                continue
+            mapping = self._match_occurrence_expansion(
+                state,
+                occurrence_source,
+                occurrence_nodeset,
+                base_order,
+            )
+            if mapping is None:
+                continue
+            matched_nodeset = frozenset(mapping)
+            matched_key = (occurrence_source, matched_nodeset)
+            if matched_key in yielded or matched_key in state._motif_class.occurrence_keys:
+                continue
+            occurrence_value = (occurrence_source, tuple(sorted(matched_nodeset, key=self._node_order_key)))
+            state._motif_class.occurrences.append(occurrence_value)
+            state._motif_class.occurrence_keys.add(matched_key)
+            state._motif_class.occurrence_mappings[matched_key] = mapping
+            yielded.add(matched_key)
+            yield (occurrence_source, matched_nodeset, mapping)
+            if stop_after is not None and len(yielded) >= stop_after:
+                return
+
+        state._scan_complete = True
+
+    def _materialize_state(
+        self,
+        state: ExpansionState[N, L, V, I],
+    ) -> _MotifClass[N, I]:
+        if not state._scan_complete:
+            for _ in self._iter_state_occurrences(state):
+                pass
+            state._motif_class.occurrences.sort(
+                key=lambda occurrence: (_stable_value_key(occurrence[0]), occurrence[1])
+            )
+        return state._motif_class
 
 
 class MotifFinder(Generic[N, L, V, I]):
@@ -645,466 +1166,6 @@ class MotifFinder(Generic[N, L, V, I]):
                 )
             )
         return tuple(sorted(node_signatures))
-
-    def _expanded_order(
-        self,
-        source: I,
-        base_order: tuple[N, ...],
-        expanded_nodeset: frozenset[N],
-    ) -> tuple[N, ...]:
-        graph = self._parents[source].graph
-        base_nodes = frozenset(base_order)
-        extra_nodes = expanded_nodeset - base_nodes
-        extra_signatures: list[tuple[tuple[Any, ...], N]] = []
-        for node in extra_nodes:
-            variables = self._node_vars(graph.nodes[node])
-            local_variable_pattern: dict[V, int] = {}
-            extra_signatures.append(
-                (
-                    (
-                        self._node_label(graph.nodes[node]) if self._default_label_matches else None,
-                        tuple(local_variable_pattern.setdefault(identifier, len(local_variable_pattern)) for identifier in variables),
-                        len(variables),
-                        tuple(int(graph.has_edge(base_node, node)) for base_node in base_order),
-                        tuple(int(graph.has_edge(node, base_node)) for base_node in base_order),
-                        graph.has_edge(node, node),
-                        sum(1 for predecessor in graph.pred[node] if predecessor in expanded_nodeset),
-                        sum(1 for successor in graph.succ[node] if successor in expanded_nodeset),
-                    ),
-                    node,
-                )
-            )
-        ordered_extra = tuple(
-            node
-            for _, node in sorted(
-                extra_signatures,
-                key=lambda item: (item[0], self._node_order_key(item[1])),
-            )
-        )
-        return base_order + ordered_extra
-
-    def _expansion_signature(
-        self,
-        graph: nx.DiGraph[N],
-        base_order: tuple[N, ...],
-        expanded_nodeset: frozenset[N],
-    ) -> tuple[Any, ...]:
-        base_nodes = frozenset(base_order)
-        extra_nodes = expanded_nodeset - base_nodes
-        extra_signatures: list[tuple[Any, ...]] = []
-        for node in extra_nodes:
-            variables = self._node_vars(graph.nodes[node])
-            local_variable_pattern: dict[V, int] = {}
-            to_base = tuple(int(graph.has_edge(base_node, node)) for base_node in base_order)
-            from_base = tuple(int(graph.has_edge(node, base_node)) for base_node in base_order)
-            in_degree = sum(1 for predecessor in graph.pred[node] if predecessor in expanded_nodeset)
-            out_degree = sum(1 for successor in graph.succ[node] if successor in expanded_nodeset)
-            extra_signatures.append(
-                (
-                    self._node_label(graph.nodes[node]) if self._default_label_matches else None,
-                    tuple(local_variable_pattern.setdefault(identifier, len(local_variable_pattern)) for identifier in variables),
-                    len(variables),
-                    to_base,
-                    from_base,
-                    graph.has_edge(node, node),
-                    in_degree,
-                    out_degree,
-                )
-        )
-        return tuple(sorted(extra_signatures))
-
-    def _anchored_slot_signature(
-        self,
-        graph: nx.DiGraph[N],
-        base_order: tuple[N, ...],
-        node: N,
-    ) -> tuple[Any, ...]:
-        variables = self._node_vars(graph.nodes[node])
-        return (
-            self._node_label(graph.nodes[node]) if self._default_label_matches else None,
-            len(variables),
-            tuple(int(graph.has_edge(base_node, node)) for base_node in base_order),
-            tuple(int(graph.has_edge(node, base_node)) for base_node in base_order),
-            graph.has_edge(node, node),
-        )
-
-    def _candidate_domain_for_slot(
-        self,
-        state: ExpansionState[N, L, V, I],
-        occurrence_source: I,
-        occurrence_nodeset: frozenset[N],
-        base_order: tuple[N, ...],
-        slot_signature: Hashable,
-    ) -> tuple[N, ...]:
-        cache_key = (occurrence_source, occurrence_nodeset, slot_signature)
-        cached = state._slot_domain_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        graph = self._parents[occurrence_source].graph
-        candidates = tuple(
-            candidate
-            for candidate in graph.nodes
-            if candidate not in occurrence_nodeset
-            and self._anchored_slot_signature(graph, base_order, candidate) == slot_signature
-        )
-        state._slot_domain_cache[cache_key] = candidates
-        return candidates
-
-    def _find_anchored_expansion(
-        self,
-        representative_graph: nx.DiGraph[N],
-        representative_order: tuple[N, ...],
-        base_size: int,
-        target_graph: nx.DiGraph[N],
-        target_base_order: tuple[N, ...],
-        candidate_domains: dict[N, tuple[N, ...]] | None = None,
-    ) -> tuple[N, ...] | None:
-        used_targets = set(target_base_order)
-        mapping = {
-            representative_order[position]: target_base_order[position]
-            for position in range(base_size)
-        }
-        source_to_target: defaultdict[int, dict[V, V]] = defaultdict(dict)
-        target_to_source: defaultdict[int, dict[V, V]] = defaultdict(dict)
-
-        def bind_variables(source_node: N, target_node: N) -> bool:
-            source_vars = self._node_vars(representative_graph.nodes[source_node])
-            target_vars = self._node_vars(target_graph.nodes[target_node])
-            if len(source_vars) != len(target_vars):
-                return False
-            for variable_class, source_identifier in enumerate(source_vars):
-                target_identifier = target_vars[variable_class]
-                existing_target = source_to_target[variable_class].get(source_identifier)
-                existing_source = target_to_source[variable_class].get(target_identifier)
-                if existing_target is not None and existing_target != target_identifier:
-                    return False
-                if existing_source is not None and existing_source != source_identifier:
-                    return False
-            for variable_class, source_identifier in enumerate(source_vars):
-                target_identifier = target_vars[variable_class]
-                source_to_target[variable_class][source_identifier] = target_identifier
-                target_to_source[variable_class][target_identifier] = source_identifier
-            return True
-
-        for position in range(base_size):
-            if not bind_variables(representative_order[position], target_base_order[position]):
-                return None
-
-        target_nodes = tuple(target_graph.nodes)
-        search_positions = list(range(base_size, len(representative_order)))
-        if candidate_domains is None:
-            candidate_domains = {}
-            for position in search_positions:
-                source_node = representative_order[position]
-                source_label = self._node_label(representative_graph.nodes[source_node])
-                source_vars = self._node_vars(representative_graph.nodes[source_node])
-                candidate_domains[source_node] = tuple(
-                    candidate
-                    for candidate in target_nodes
-                    if candidate not in used_targets
-                    and self._label_matches(source_label, self._node_label(target_graph.nodes[candidate]))
-                    and len(source_vars) == len(self._node_vars(target_graph.nodes[candidate]))
-                    and target_graph.has_edge(candidate, candidate) == representative_graph.has_edge(source_node, source_node)
-                    and all(
-                        representative_graph.has_edge(representative_order[previous_position], source_node)
-                        == target_graph.has_edge(target_base_order[previous_position], candidate)
-                        and representative_graph.has_edge(source_node, representative_order[previous_position])
-                        == target_graph.has_edge(candidate, target_base_order[previous_position])
-                        for previous_position in range(base_size)
-                    )
-                )
-        search_positions.sort(key=lambda position: len(candidate_domains[representative_order[position]]))
-        if search_positions and len(candidate_domains[representative_order[search_positions[0]]]) == 0:
-            return None
-
-        def search(depth: int) -> bool:
-            if depth == len(search_positions):
-                return True
-
-            position = search_positions[depth]
-            source_node = representative_order[position]
-            source_label = self._node_label(representative_graph.nodes[source_node])
-            source_vars = self._node_vars(representative_graph.nodes[source_node])
-            for candidate in candidate_domains[source_node]:
-                if candidate in used_targets:
-                    continue
-                for previous_source, previous_target in mapping.items():
-                    if representative_graph.has_edge(previous_source, source_node) != target_graph.has_edge(previous_target, candidate):
-                        break
-                    if representative_graph.has_edge(source_node, previous_source) != target_graph.has_edge(candidate, previous_target):
-                        break
-                else:
-                    snapshot_source = {variable_class: dict(value) for variable_class, value in source_to_target.items()}
-                    snapshot_target = {variable_class: dict(value) for variable_class, value in target_to_source.items()}
-                    if not bind_variables(source_node, candidate):
-                        source_to_target.clear()
-                        target_to_source.clear()
-                        source_to_target.update({variable_class: dict(value) for variable_class, value in snapshot_source.items()})
-                        target_to_source.update({variable_class: dict(value) for variable_class, value in snapshot_target.items()})
-                        continue
-                    mapping[source_node] = candidate
-                    used_targets.add(candidate)
-                    if search(depth + 1):
-                        return True
-                    used_targets.remove(candidate)
-                    del mapping[source_node]
-                    source_to_target.clear()
-                    target_to_source.clear()
-                    source_to_target.update({variable_class: dict(value) for variable_class, value in snapshot_source.items()})
-                    target_to_source.update({variable_class: dict(value) for variable_class, value in snapshot_target.items()})
-
-            return False
-
-        if not search(0):
-            return None
-        return tuple(mapping[node] for node in representative_order)
-
-    def _expand_motif_class(
-        self,
-        state: ExpansionState[N, L, V, I],
-        source: I,
-        witness_nodeset: frozenset[N],
-        expanded_nodeset: frozenset[N],
-    ) -> ExpansionState[N, L, V, I] | None:
-        motif_class = state._motif_class
-        witness_key = (source, witness_nodeset)
-        if witness_key not in motif_class.occurrence_mappings:
-            raise ValueError("witness is not an occurrence of this motif")
-        if not witness_nodeset.issubset(expanded_nodeset):
-            raise ValueError("expanded nodes must be a superset of the witness")
-
-        representative_base_order = motif_class.representative_order
-        origin_base_order = motif_class.occurrence_mappings[witness_key]
-        representative_expanded_order = self._expanded_order(source, origin_base_order, expanded_nodeset)
-        representative_graph = self._parents[source].graph.subgraph(expanded_nodeset)
-        assert isinstance(representative_graph, nx.DiGraph)
-
-        expanded_motif_class = _MotifClass(
-            representative=_OccurrenceRef(source=source, nodeset=expanded_nodeset),
-            representative_order=representative_expanded_order,
-            occurrences=[(source, tuple(sorted(expanded_nodeset, key=self._node_order_key)))],
-            occurrence_keys={(source, expanded_nodeset)},
-            occurrence_mappings={(source, expanded_nodeset): representative_expanded_order},
-        )
-
-        for occurrence_source, occurrence_nodes in motif_class.occurrences:
-            occurrence_nodeset = frozenset(occurrence_nodes)
-            occurrence_key = (occurrence_source, occurrence_nodeset)
-            base_order = motif_class.occurrence_mappings[occurrence_key]
-
-            sampled_match: tuple[N, ...] | None = None
-            for candidate_nodeset in self._candidate_supersets_for(
-                state,
-                occurrence_source,
-                occurrence_nodeset,
-                len(expanded_nodeset),
-            ):
-                candidate_graph = self._parents[occurrence_source].graph.subgraph(candidate_nodeset)
-                assert isinstance(candidate_graph, nx.DiGraph)
-                mapping = self._find_anchored_expansion(
-                    representative_graph,
-                    representative_expanded_order,
-                    len(representative_base_order),
-                    candidate_graph,
-                    base_order,
-                )
-                if mapping is not None:
-                    sampled_match = mapping
-                    break
-
-            if sampled_match is None:
-                sampled_match = self._find_anchored_expansion(
-                    representative_graph,
-                    representative_expanded_order,
-                    len(representative_base_order),
-                    self._parents[occurrence_source].graph,
-                    base_order,
-                )
-
-            if sampled_match is None:
-                continue
-
-            matched_nodeset = frozenset(sampled_match)
-            occurrence_value = (occurrence_source, tuple(sorted(matched_nodeset, key=self._node_order_key)))
-            occurrence_cache_key = (occurrence_source, matched_nodeset)
-            if occurrence_cache_key in expanded_motif_class.occurrence_keys:
-                continue
-            expanded_motif_class.occurrences.append(occurrence_value)
-            expanded_motif_class.occurrence_keys.add(occurrence_cache_key)
-            expanded_motif_class.occurrence_mappings[occurrence_cache_key] = sampled_match
-
-        if len(expanded_motif_class.occurrences) < 2:
-            return None
-        return self.expansion().state_for_motif_class(expanded_motif_class)
-
-    def _candidate_supersets_for(
-        self,
-        state: ExpansionState[N, L, V, I],
-        source: I,
-        witness_nodeset: frozenset[N],
-        target_size: int,
-    ) -> tuple[frozenset[N], ...]:
-        cache_key = (source, witness_nodeset, target_size)
-        cached = state._candidate_supersets_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        parent = self._parents[source]
-        candidates = tuple(
-            candidate_nodeset
-            for candidate_nodeset in parent.nodesets_by_size.get(target_size, ())
-            if witness_nodeset.issubset(candidate_nodeset)
-        )
-        state._candidate_supersets_cache[cache_key] = candidates
-        return candidates
-
-    def _match_occurrence_expansion(
-        self,
-        state: ExpansionState[N, L, V, I],
-        occurrence_source: I,
-        occurrence_nodeset: frozenset[N],
-        base_order: tuple[N, ...],
-        representative_signature: tuple[Any, ...],
-    ) -> tuple[N, ...] | None:
-        if state._base_size is None:
-            raise ValueError("expansion state missing base size")
-
-        representative_graph = self._parents[state._motif_class.representative.source].graph.subgraph(
-            state._motif_class.representative.nodeset
-        )
-        assert isinstance(representative_graph, nx.DiGraph)
-        cache_owner = state._predecessor_state if state._predecessor_state is not None else state
-        candidate_domains: dict[N, tuple[N, ...]] = {}
-        for source_node in state._motif_class.representative_order[state._base_size:]:
-            slot_signature = self._anchored_slot_signature(
-                representative_graph,
-                state._motif_class.representative_order[:state._base_size],
-                source_node,
-            )
-            candidate_domains[source_node] = self._candidate_domain_for_slot(
-                cache_owner,
-                occurrence_source,
-                occurrence_nodeset,
-                base_order,
-                slot_signature,
-            )
-            if not candidate_domains[source_node]:
-                return None
-
-        sampled_match: tuple[N, ...] | None = None
-        for candidate_nodeset in self._candidate_supersets_for(
-            state._predecessor_state if state._predecessor_state is not None else state,
-            occurrence_source,
-            occurrence_nodeset,
-            len(state._motif_class.representative.nodeset),
-        ):
-            if (
-                self._expansion_signature(
-                    self._parents[occurrence_source].graph,
-                    base_order,
-                    candidate_nodeset,
-                )
-                != representative_signature
-            ):
-                continue
-            candidate_graph = self._parents[occurrence_source].graph.subgraph(candidate_nodeset)
-            assert isinstance(candidate_graph, nx.DiGraph)
-            mapping = self._find_anchored_expansion(
-                representative_graph,
-                state._motif_class.representative_order,
-                state._base_size,
-                candidate_graph,
-                base_order,
-                candidate_domains,
-            )
-            if mapping is not None:
-                sampled_match = mapping
-                break
-
-        if sampled_match is None:
-            sampled_match = self._find_anchored_expansion(
-                representative_graph,
-                state._motif_class.representative_order,
-                state._base_size,
-                self._parents[occurrence_source].graph,
-                base_order,
-                candidate_domains,
-            )
-
-        return sampled_match
-
-    def _iter_state_occurrences(
-        self,
-        state: ExpansionState[N, L, V, I],
-        *,
-        stop_after: int | None = None,
-    ) -> Iterator[tuple[I, frozenset[N], tuple[N, ...]]]:
-        yielded: set[tuple[I, frozenset[N]]] = set()
-        for occurrence_source, occurrence_nodes in state._motif_class.occurrences:
-            occurrence_nodeset = frozenset(occurrence_nodes)
-            occurrence_key = (occurrence_source, occurrence_nodeset)
-            yielded.add(occurrence_key)
-            yield (
-                occurrence_source,
-                occurrence_nodeset,
-                state._motif_class.occurrence_mappings[occurrence_key],
-            )
-            if stop_after is not None and len(yielded) >= stop_after:
-                return
-
-        if state._scan_complete:
-            return
-        if state._predecessor_state is None or state._base_size is None:
-            state._scan_complete = True
-            return
-
-        representative_graph = self._parents[state._motif_class.representative.source].graph
-        representative_signature = self._expansion_signature(
-            representative_graph,
-            state._motif_class.representative_order[:state._base_size],
-            state._motif_class.representative.nodeset,
-        )
-
-        for occurrence_source, occurrence_nodeset, base_order in self._iter_state_occurrences(state._predecessor_state):
-            occurrence_key = (occurrence_source, occurrence_nodeset)
-            if occurrence_key in yielded:
-                continue
-            mapping = self._match_occurrence_expansion(
-                state,
-                occurrence_source,
-                occurrence_nodeset,
-                base_order,
-                representative_signature,
-            )
-            if mapping is None:
-                continue
-            matched_nodeset = frozenset(mapping)
-            matched_key = (occurrence_source, matched_nodeset)
-            if matched_key in state._motif_class.occurrence_keys:
-                continue
-            occurrence_value = (occurrence_source, tuple(sorted(matched_nodeset, key=self._node_order_key)))
-            state._motif_class.occurrences.append(occurrence_value)
-            state._motif_class.occurrence_keys.add(matched_key)
-            state._motif_class.occurrence_mappings[matched_key] = mapping
-            yielded.add(matched_key)
-            yield (occurrence_source, matched_nodeset, mapping)
-            if stop_after is not None and len(yielded) >= stop_after:
-                return
-
-        state._scan_complete = True
-
-    def _materialize_state(
-        self,
-        state: ExpansionState[N, L, V, I],
-    ) -> _MotifClass[N, I]:
-        if not state._scan_complete:
-            for _ in self._iter_state_occurrences(state):
-                pass
-            state._motif_class.occurrences.sort(
-                key=lambda occurrence: (_stable_value_key(occurrence[0]), occurrence[1])
-            )
-        return state._motif_class
 
     def validate_expansion(
         self,

@@ -221,6 +221,66 @@ class TestUnits(unittest.TestCase):
         assert state4 is not None
         self.assertIn((0, frozenset({0, 1, 2, 3})), state4._motif_class.occurrence_mappings)
 
+    def test_invalid_expansion_is_not_registered_as_known_occurrence(self):
+        g0 = nx.DiGraph()
+        g0.add_node(0, label=0, vars=())
+        g0.add_node(1, label=1, vars=())
+        g0.add_node(2, label=2, vars=())
+        g0.add_edge(0, 1)
+        g0.add_edge(1, 2)
+
+        g1 = nx.DiGraph()
+        g1.add_node(10, label=0, vars=())
+        g1.add_node(11, label=1, vars=())
+        g1.add_node(12, label=3, vars=())
+        g1.add_edge(10, 11)
+        g1.add_edge(11, 12)
+
+        finder: MotifFinder[int, int, int, int] = MotifFinder(
+            {
+                0: (g0, frozenset({frozenset({0, 1})})),
+                1: (g1, frozenset({frozenset({10, 11})})),
+            },
+            node_label,
+            node_vars,
+        )
+        expansion = finder.expansion()
+        state2 = next(finder.motifs(2)).state_for((0, {0, 1}))
+
+        self.assertIsNone(expansion.validate_expansion(state2, 0, {0, 1}, {0, 1, 2}))
+        with self.assertRaises(ValueError):
+            expansion.state_for_occurrence(0, {0, 1, 2})
+
+    def test_expansion_cache_reuses_anchored_slot_domains(self):
+        g0 = nx.DiGraph()
+        for node, label in ((0, 0), (1, 1), (2, 2), (3, 2)):
+            g0.add_node(node, label=label, vars=())
+        g0.add_edges_from([(0, 1), (1, 2), (1, 3)])
+
+        g1 = nx.DiGraph()
+        g1.add_node(10, label=0, vars=())
+        g1.add_node(11, label=1, vars=())
+        g1.add_node(12, label=3, vars=())
+        g1.add_edge(10, 11)
+        g1.add_edge(11, 12)
+
+        finder: MotifFinder[int, int, int, int] = MotifFinder(
+            {
+                0: (g0, frozenset({frozenset({0, 1})})),
+                1: (g1, frozenset({frozenset({10, 11})})),
+            },
+            node_label,
+            node_vars,
+        )
+        state2 = next(finder.motifs(2)).state_for((0, {0, 1}))
+
+        self.assertIsNone(finder.validate_expansion(state2, 0, {0, 1}, {0, 1, 2}))
+        cached_domains = len(state2._slot_domain_cache)
+        self.assertGreater(cached_domains, 0)
+
+        self.assertIsNone(finder.validate_expansion(state2, 0, {0, 1}, {0, 1, 3}))
+        self.assertEqual(len(state2._slot_domain_cache), cached_domains)
+
     def test_motif_expansion_recovers_unindexed_state_by_occurrence(self):
         g0 = nx.DiGraph()
         for node, label in enumerate(range(5)):
